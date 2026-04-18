@@ -129,9 +129,10 @@ def query_gemini(api_key, prompt, timeout=60, max_retries=3):
                         return parts[0].get('text', '')
             return None
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < max_retries - 1:
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
                 backoff = 4 * (2 ** attempt)  # 4s, 8s, 16s
-                warn(f"Gemini rate limited (429), retrying in {backoff}s... (attempt {attempt+1}/{max_retries})")
+                label = 'rate limited (429)' if e.code == 429 else f'server error ({e.code})'
+                warn(f"Gemini {label}, retrying in {backoff}s... (attempt {attempt+1}/{max_retries})")
                 time.sleep(backoff)
                 continue
             warn(f"Gemini API error: HTTP {e.code} {e.reason}")
@@ -143,7 +144,7 @@ def query_gemini(api_key, prompt, timeout=60, max_retries=3):
 
 def ai_phase_advisor(api_key, phase_name, context, question, puter_token=None):
     """Ask AI for advice at a specific phase. Returns advice string or None."""
-    if not api_key and not puter_token and not os.environ.get('PUTER_AUTH_TOKEN'):
+    if not api_key and not _puter_pkg_available():
         return None
     prompt = f"""You are an expert penetration tester conducting a CTF/bug bounty engagement.
 You are at the "{phase_name}" phase of an automated nmap reconnaissance.
@@ -165,7 +166,7 @@ Focus on actionable intelligence. No disclaimers or ethics warnings - this is au
 
 def ai_github_nse_search(api_key, service_name, product, version, puter_token=None):
     """Ask AI to suggest GitHub NSE scripts for an unknown service."""
-    if not api_key and not puter_token and not os.environ.get('PUTER_AUTH_TOKEN'):
+    if not api_key and not _puter_pkg_available():
         return None
     prompt = f"""I discovered a service during nmap scanning that I don't have specialized NSE scripts for:
 Service: {service_name}
@@ -186,35 +187,55 @@ Be specific with URLs and commands. Only suggest real, known repositories."""
 # PUTER / QWEN AI (FALLBACK)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_PUTER_MODEL = "qwen/qwen3.6-plus"
+_PUTER_MODEL = "gpt-5.4-nano"  # free tier model via Puter User-Pays
+_PUTER_PKG_OK = None           # cached package-check result
 
-def query_puter_ai(prompt, puter_token=None, model=None, timeout=90):
-    """Query Puter.js Qwen AI via Node.js subprocess. Returns response text or None.
-    Requires: npm install -g @heyputer/puter.js, and PUTER_AUTH_TOKEN env or --puter-token."""
-    if not puter_token:
-        puter_token = os.environ.get('PUTER_AUTH_TOKEN', '')
-    if not puter_token or not shutil.which('node'):
+
+def _puter_pkg_available():
+    """Check once if @heyputer/puter.js is installed. Cached after first call."""
+    global _PUTER_PKG_OK
+    if _PUTER_PKG_OK is not None:
+        return _PUTER_PKG_OK
+    if not shutil.which('node'):
+        _PUTER_PKG_OK = False
+        return False
+    try:
+        r = subprocess.run(
+            ['node', '-e', 'require("@heyputer/puter.js"); process.exit(0)'],
+            capture_output=True, timeout=6)
+        _PUTER_PKG_OK = (r.returncode == 0)
+    except Exception:
+        _PUTER_PKG_OK = False
+    return _PUTER_PKG_OK
+
+
+def query_puter_ai(prompt, model=None, timeout=90):
+    """Query GPT via Puter.js User-Pays model — no API key required.
+    Only needs: npm install -g @heyputer/puter.js  (and node on PATH)."""
+    if not _puter_pkg_available():
         return None
     model = model or _PUTER_MODEL
     import base64
     b64_prompt = base64.b64encode(prompt.encode()).decode()
+    # Puter.js works anonymously in Node.js — no init(token) needed
     script = (
-        'const{init}=require("@heyputer/puter.js/src/init.cjs");'
-        'const p=init(process.env._PT);'
+        'const puter=require("@heyputer/puter.js");'
         'const pr=Buffer.from(process.env._PP,"base64").toString("utf8");'
-        'p.ai.chat(pr,{model:process.env._PM}).then(r=>{'
-        'const t=typeof r==="string"?r:(r&&r.message?r.message.content||"":"");'
-        'process.stdout.write(t||JSON.stringify(r));'
+        'puter.ai.chat(pr,{model:process.env._PM}).then(r=>{'
+        'const t=typeof r==="string"?r:'
+        '(r&&r.message&&r.message.content?r.message.content:'
+        '(r&&r.text?r.text:JSON.stringify(r)));'
+        'process.stdout.write(t);'
         '}).catch(e=>{process.stderr.write(String(e));process.exit(1)});'
     )
-    env = {**os.environ, '_PT': puter_token, '_PP': b64_prompt, '_PM': model}
+    env = {**os.environ, '_PP': b64_prompt, '_PM': model}
     try:
         result = subprocess.run(['node', '-e', script],
                                 capture_output=True, text=True, timeout=timeout, env=env)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
-        if 'MODULE_NOT_FOUND' in (result.stderr or ''):
-            warn("@heyputer/puter.js not found. Install: npm install -g @heyputer/puter.js")
+        if result.stderr:
+            warn(f"Puter AI error: {result.stderr[:200]}")
         return None
     except subprocess.TimeoutExpired:
         warn("Puter AI timed out")
@@ -224,21 +245,21 @@ def query_puter_ai(prompt, puter_token=None, model=None, timeout=90):
 
 
 def query_ai(prompt, api_key=None, puter_token=None, timeout=60):
-    """Unified AI query with automatic provider fallback. Tries Gemini -> Puter/Qwen."""
+    """Unified AI query: Gemini first, then Puter/GPT (no key needed) as fallback."""
     if api_key:
         result = query_gemini(api_key, prompt, timeout=timeout)
         if result:
             return result
-    if puter_token or os.environ.get('PUTER_AUTH_TOKEN'):
-        result = query_puter_ai(prompt, puter_token=puter_token, timeout=timeout)
-        if result:
-            return result
+    # Puter is always tried as fallback — no token needed
+    result = query_puter_ai(prompt, timeout=timeout)
+    if result:
+        return result
     return None
 
 
 def ai_phase_advisor_v2(api_key, puter_token, phase_name, context, question):
     """Ask AI for advice at a specific phase. Uses unified provider fallback."""
-    if not api_key and not puter_token and not os.environ.get('PUTER_AUTH_TOKEN'):
+    if not api_key and not _puter_pkg_available():
         return None
     prompt = f"""You are an expert penetration tester conducting a CTF/bug bounty engagement.
 You are at the "{phase_name}" phase of an automated nmap reconnaissance.
@@ -298,6 +319,229 @@ def run_searchsploit_nmap(xml_file):
         return ''
 
 
+
+# Maps nmap product strings (lowercase) to additional searchsploit-friendly aliases.
+# Nmap often reports a different name than what exploitdb uses.
+PRODUCT_ALIASES = {
+    # ── HTTP File Servers ──
+    'httpfileserver':               ['HFS', 'Rejetto HFS'],
+    'hfs':                          ['HFS', 'Rejetto HFS'],
+    'rejetto httpfileserver':       ['HFS', 'Rejetto HFS'],
+    # ── Web / App Servers ──
+    'microsoft-iis':                ['IIS', 'Microsoft IIS'],
+    'microsoft iis httpd':          ['IIS', 'Microsoft IIS'],
+    'microsoft iis':                ['IIS'],
+    'apache httpd':                 ['Apache'],
+    'apache':                       ['Apache'],
+    'nginx':                        ['Nginx'],
+    'lighttpd':                     ['Lighttpd'],
+    'cherokee httpd':               ['Cherokee'],
+    'openresty':                    ['OpenResty', 'Nginx'],
+    # ── Java App Servers ──
+    'apache tomcat':                ['Tomcat', 'Apache Tomcat'],
+    'apache tomcat/coyote':         ['Tomcat', 'Apache Tomcat'],
+    'apache-coyote':                ['Tomcat', 'Apache Tomcat'],
+    'jetty':                        ['Jetty', 'Eclipse Jetty'],
+    'jboss':                        ['JBoss'],
+    'jboss jmx-console':            ['JBoss'],
+    'wildfly':                      ['WildFly', 'JBoss WildFly'],
+    'weblogic':                     ['WebLogic', 'Oracle WebLogic'],
+    'websphere':                    ['WebSphere', 'IBM WebSphere'],
+    'glassfish':                    ['GlassFish'],
+    'payara':                       ['Payara', 'GlassFish'],
+    # ── SSH ──
+    'openssh':                      ['OpenSSH'],
+    'openssh for_windows':          ['OpenSSH', 'OpenSSH Windows'],
+    'dropbear sshd':                ['Dropbear', 'Dropbear SSH'],
+    'libssh':                       ['libssh'],
+    'bitvise':                      ['Bitvise'],
+    # ── FTP ──
+    'proftpd':                      ['ProFTPD'],
+    'vsftpd':                       ['vsftpd'],
+    'pure-ftpd':                    ['Pure-FTPd', 'PureFTPd'],
+    'filezilla ftpd':               ['FileZilla'],
+    'filezilla server':             ['FileZilla'],
+    'microsoft ftpd':               ['Microsoft FTP'],
+    'war-ftpd':                     ['War-FTPd'],
+    'gene6 ftpd':                   ['Gene6 FTP'],
+    'globalscape eft':              ['GlobalSCAPE EFT'],
+    # ── SMTP ──
+    'postfix smtpd':                ['Postfix'],
+    'exim smtpd':                   ['Exim'],
+    'exim':                         ['Exim'],
+    'sendmail':                     ['Sendmail'],
+    'microsoft esmtp':              ['Exchange', 'Microsoft Exchange'],
+    'hmail server':                 ['hMailServer'],
+    # ── IMAP/POP3 ──
+    'dovecot imapd':                ['Dovecot'],
+    'dovecot pop3d':                ['Dovecot'],
+    'cyrus imapd':                  ['Cyrus IMAP'],
+    'uw imapd':                     ['UW-IMAP'],
+    # ── Databases ──
+    'mysql':                        ['MySQL'],
+    'mysql community server':       ['MySQL'],
+    'mariadb':                      ['MariaDB', 'MySQL'],
+    'microsoft sql server':         ['MSSQL', 'Microsoft SQL'],
+    'postgresql':                   ['PostgreSQL'],
+    'mongodb':                      ['MongoDB'],
+    'redis':                        ['Redis'],
+    'couchdb':                      ['CouchDB'],
+    'elasticsearch':                ['Elasticsearch'],
+    'cassandra':                    ['Cassandra', 'Apache Cassandra'],
+    'memcached':                    ['Memcached'],
+    'riak':                         ['Riak'],
+    'influxdb':                     ['InfluxDB'],
+    'neo4j':                        ['Neo4j'],
+    'orientdb':                     ['OrientDB'],
+    'cockroachdb':                  ['CockroachDB'],
+    # ── CMS / Web Apps ──
+    'wordpress':                    ['WordPress'],
+    'drupal':                       ['Drupal'],
+    'joomla':                       ['Joomla'],
+    'typo3':                        ['TYPO3'],
+    'magento':                      ['Magento'],
+    'moodle':                       ['Moodle'],
+    'liferay':                      ['Liferay'],
+    'sharepoint':                   ['SharePoint', 'Microsoft SharePoint'],
+    # ── DevOps / CI ──
+    'jenkins':                      ['Jenkins'],
+    'gitlab':                       ['GitLab'],
+    'confluence':                   ['Confluence', 'Atlassian Confluence'],
+    'jira':                         ['Jira', 'Atlassian JIRA'],
+    'bamboo':                       ['Bamboo', 'Atlassian Bamboo'],
+    'bitbucket':                    ['Bitbucket', 'Atlassian Bitbucket'],
+    'teamcity':                     ['TeamCity'],
+    'nexus':                        ['Nexus', 'Sonatype Nexus'],
+    'sonarqube':                    ['SonarQube'],
+    'artifactory':                  ['Artifactory', 'JFrog Artifactory'],
+    # ── Monitoring ──
+    'nagios':                       ['Nagios'],
+    'zabbix':                       ['Zabbix'],
+    'grafana':                      ['Grafana'],
+    'kibana':                       ['Kibana'],
+    'prometheus':                   ['Prometheus'],
+    'icinga':                       ['Icinga'],
+    'checkmk':                      ['Check_MK'],
+    # ── Messaging / Queue ──
+    'activemq':                     ['ActiveMQ', 'Apache ActiveMQ'],
+    'rabbitmq':                     ['RabbitMQ'],
+    'kafka':                        ['Kafka', 'Apache Kafka'],
+    # ── Network / Proxy ──
+    'squid http proxy':             ['Squid'],
+    'squid':                        ['Squid'],
+    'haproxy':                      ['HAProxy'],
+    'varnish':                      ['Varnish'],
+    'f5 big-ip':                    ['F5 BIG-IP'],
+    'citrix':                       ['Citrix'],
+    # ── Directory / Auth ──
+    'openldap':                     ['OpenLDAP'],
+    '389 directory server':         ['389-ds'],
+    'freeipa':                      ['FreeIPA'],
+    'active directory':             ['Active Directory'],
+    # ── VPN / Remote Access ──
+    'openvpn':                      ['OpenVPN'],
+    'openssl':                      ['OpenSSL'],
+    'webmin':                       ['Webmin'],
+    'webmin httpd':                 ['Webmin'],
+    'virtualmin':                   ['Virtualmin', 'Webmin'],
+    # ── Windows Specific ──
+    'microsoft httpapi httpd':      ['WinRM', 'IIS'],
+    'exchange httpapi':             ['Exchange', 'Microsoft Exchange'],
+    'microsoft windows rpc':        ['MSRPC'],
+    # ── Networking / Embedded ──
+    'mikrotik':                     ['MikroTik', 'RouterOS'],
+    'routeros':                     ['MikroTik', 'RouterOS'],
+    'cisco':                        ['Cisco'],
+    'cisco ios':                    ['Cisco IOS'],
+    'pfsense':                      ['pfSense'],
+    'openwrt':                      ['OpenWrt'],
+    'fortinet':                     ['Fortinet'],
+    # ── VNC / RDP ──
+    'vnc':                          ['VNC'],
+    'realvnc':                      ['RealVNC'],
+    'tightvnc':                     ['TightVNC'],
+    'ultravnc':                     ['UltraVNC'],
+    # ── Container / Cloud ──
+    'docker':                       ['Docker'],
+    'kubernetes':                   ['Kubernetes'],
+    'etcd':                         ['etcd'],
+    'consul':                       ['Consul'],
+    'vault':                        ['Vault', 'HashiCorp Vault'],
+    # ── IRCd ──
+    'unrealircd':                   ['UnrealIRCd'],
+    'inspircd':                     ['InspIRCd'],
+    'ngircd':                       ['ngIRCd'],
+    # ── Misc ──
+    'nagios nrpe':                  ['NRPE', 'Nagios NRPE'],
+    'cups':                         ['CUPS'],
+    'zimbra':                       ['Zimbra'],
+    'minio':                        ['MinIO'],
+    'spring':                       ['Spring', 'Spring Framework'],
+    'struts':                       ['Struts', 'Apache Struts'],
+}
+
+# Noise words to strip when dynamically normalizing product names
+_PRODUCT_NOISE = re.compile(
+    r'\b(httpd|server|daemon|service|the|for_windows|for_linux|for_macos|'
+    r'community|enterprise|open source|open-source|httpapi|http|smtpd|'
+    r'imapd|pop3d|ftpd|sshd|db|database|api|rest|rpc|proxy)\b',
+    re.IGNORECASE
+)
+
+
+def _product_query_variants(product, version):
+    """Return a de-duplicated list of searchsploit query strings for a product."""
+    variants = []
+    p = product.strip()
+    v = (version or '').strip()
+
+    # 1. Exact name + version, exact name only
+    if p and v:
+        variants.append(f"{p} {v}")
+    if p:
+        variants.append(p)
+
+    # 2. Known alias map
+    for alias in PRODUCT_ALIASES.get(p.lower(), []):
+        if v:
+            variants.append(f"{alias} {v}")
+        variants.append(alias)
+
+    # 3. Dynamic: strip noise words and retry
+    stripped = _PRODUCT_NOISE.sub('', p).strip()
+    stripped = re.sub(r'\s+', ' ', stripped).strip()
+    if stripped and stripped.lower() != p.lower() and len(stripped) > 2:
+        if v:
+            variants.append(f"{stripped} {v}")
+        variants.append(stripped)
+
+    # 4. Dynamic: CamelCase acronym (HttpFileServer → HFS)
+    acronym = ''.join(c for c in p if c.isupper())
+    if len(acronym) >= 2 and acronym.lower() != p.lower():
+        if v:
+            variants.append(f"{acronym} {v}")
+        variants.append(acronym)
+
+    # 5. Major version only (strip patch: 2.3.1 → 2.3)
+    if v:
+        major = re.match(r'^(\d+\.\d+)', v)
+        if major and major.group(1) != v:
+            variants.append(f"{p} {major.group(1)}")
+            for alias in PRODUCT_ALIASES.get(p.lower(), []):
+                variants.append(f"{alias} {major.group(1)}")
+
+    # De-duplicate preserving order, drop empty/short entries
+    seen = set()
+    result = []
+    for q in variants:
+        q = q.strip()
+        if len(q) < 3 or q.lower() in seen:
+            continue
+        seen.add(q.lower())
+        result.append(q)
+    return result
+
+
 def searchsploit_services(services, outdir=None):
     """Run searchsploit for all identified services. Returns dict of {query: [results]}."""
     if not shutil.which('searchsploit'):
@@ -309,12 +553,7 @@ def searchsploit_services(services, outdir=None):
         version = svc.get('version', '').strip()
         if not product:
             continue
-        # Build search queries - try specific then broad
-        queries = []
-        if product and version:
-            queries.append(f"{product} {version}")
-        if product:
-            queries.append(product)
+        queries = _product_query_variants(product, version)
         for query in queries:
             if query in seen_queries or len(query) < 3:
                 continue
@@ -1062,6 +1301,11 @@ VULN_DB = [
      'curl http://TARGET:6082/'),
     (r'cockroachdb', r'', 'CockroachDB - Check for no auth', '',
      'Try: cockroach sql --insecure --host=TARGET'),
+    # ── HFS / Rejetto ──
+    (r'httpfileserver|rejetto|hfs', r'2\.[23]', 'Rejetto HFS 2.3.x Remote Command Execution', 'CVE-2014-6287',
+     'Metasploit: exploit/windows/http/rejetto_hfs_exec'),
+    (r'httpfileserver|rejetto|hfs', r'2\.[4-9]', 'Rejetto HFS 2.x Unauthenticated RCE', 'CVE-2024-23692',
+     'Metasploit: exploit/windows/http/rejetto_hfs_rce_cve_2024_23692'),
 ]
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -3047,6 +3291,89 @@ def guess_severity(desc, cve=''):
     return 'info'
 
 
+def _builtin_attack_path(target, services, vulns_sorted, sploit_results, outdir):
+    """Print a heuristic attack path summary. Always runs, no AI required."""
+    subsection("Attack Path Summary")
+
+    criticals = [v for v in vulns_sorted if v.get('severity') in ('critical', 'high')]
+    meds = [v for v in vulns_sorted if v.get('severity') == 'medium']
+
+    if criticals:
+        print(f"\n  {C.R}{C.Bo}CRITICAL/HIGH — Start Here:{C.Re}")
+        for v in criticals:
+            print(f"    {C.R}[!]{C.Re} Port {v['port']}: {v['desc']}")
+            if v.get('cve'):
+                print(f"        CVE: {v['cve']}")
+            if v.get('exploit'):
+                print(f"        {C.Y}{v['exploit']}{C.Re}")
+    else:
+        print(f"  {C.Di}No critical/high vulns detected by scanner.{C.Re}")
+
+    # Highlight searchsploit hits
+    if sploit_results:
+        print(f"\n  {C.G}{C.Bo}Searchsploit Matches:{C.Re}")
+        for query, results in sploit_results.items():
+            for r in results[:3]:
+                edb = r.get('EDB-ID', '')
+                title = r.get('Title', '')
+                path = r.get('Path', '')
+                print(f"    {C.Y}[EDB-{edb}]{C.Re} {title}")
+                if path:
+                    short = path.split('exploits/')[-1] if 'exploits/' in path else path
+                    print(f"            searchsploit -x {short}")
+
+    # Quick-win service hints
+    svc_names = {s.get('service', '') for s in services.values()}
+    product_names = ' '.join(s.get('product', '').lower() for s in services.values())
+
+    print(f"\n  {C.B}{C.Bo}Quick Wins by Service:{C.Re}")
+    hints = []
+    if any(s in svc_names for s in ('ftp',)):
+        hints.append("FTP: try anonymous login → ftp {t} (user: anonymous)")
+    if 'smb' in product_names or any(s in svc_names for s in ('microsoft-ds', 'netbios-ssn')):
+        hints.append("SMB: null session → smbclient -L //{t} -N && smbmap -H {t}")
+        hints.append("SMB: check EternalBlue → use exploit/windows/smb/ms17_010_eternalblue")
+    if 'httpfileserver' in product_names or 'hfs' in product_names:
+        hints.append("HFS 2.3: RCE via Metasploit → use exploit/windows/http/rejetto_hfs_exec")
+        hints.append("HFS 2.3: set RHOSTS {t}, set RPORT 8080, run")
+    if 'winrm' in svc_names or '5985' in str(services.keys()):
+        hints.append("WinRM: evil-winrm -i {t} -u USERNAME -p PASSWORD")
+    if 'rdp' in svc_names or 'ms-wbt-server' in svc_names:
+        hints.append("RDP: xfreerdp /v:{t} /u:Administrator /p:PASSWORD")
+    if 'ssh' in svc_names:
+        hints.append("SSH: hydra -L users.txt -P /usr/share/wordlists/rockyou.txt ssh://{t}")
+    if any(s in svc_names for s in ('http', 'http-proxy')):
+        hints.append("HTTP: gobuster dir -u http://{t}:PORT -w /usr/share/wordlists/dirb/common.txt")
+    if not hints:
+        hints.append("Run: nmap --script vuln -p- {t} for deeper vuln scan")
+
+    for h in hints:
+        print(f"    {C.Cy}→{C.Re} {h.format(t=target)}")
+
+    if meds:
+        print(f"\n  {C.Y}Medium severity findings: {len(meds)} (see REPORT.md){C.Re}")
+
+    lines = [f"# Attack Path Summary — {target}\n"]
+    if criticals:
+        lines.append("## Critical/High Findings")
+        for v in criticals:
+            lines.append(f"- **[{v['port']}]** {v['desc']} ({v.get('cve','')})")
+            lines.append(f"  - {v.get('exploit','')}")
+    if sploit_results:
+        lines.append("\n## Searchsploit Matches")
+        for query, results in sploit_results.items():
+            for r in results[:5]:
+                lines.append(f"- [EDB-{r.get('EDB-ID','')}] {r.get('Title','')}")
+    lines.append("\n## Quick Wins")
+    for h in hints:
+        lines.append(f"- {h.format(t=target)}")
+    try:
+        (outdir / 'attack_path.md').write_text('\n'.join(lines))
+        good(f"Attack path saved to: {outdir / 'attack_path.md'}")
+    except Exception:
+        pass
+
+
 def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=None, os_info=None,
                      sploit_results=None, puter_token=None, hostnames=None):
     """Phase 6: Deep Analysis, CTF Guidance & Report."""
@@ -3142,6 +3469,9 @@ def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=No
     suggestions = generate_suggestions(target, services, vulns_sorted)
     for s in suggestions:
         print(f"    {C.Cy}{s}{C.Re}")
+
+    # ── Built-in Attack Path (always shown) ──
+    _builtin_attack_path(target, services, vulns_sorted, sploit_results, outdir)
 
     # AI Deep Analysis
     ai_response = None
@@ -3810,9 +4140,9 @@ def _run_single_target(target, args, api_key, puter_token):
     ai_providers = []
     if api_key:
         ai_providers.append('Gemini')
-    if puter_token or os.environ.get('PUTER_AUTH_TOKEN'):
-        ai_providers.append(f'Puter/Qwen ({_PUTER_MODEL})')
-    ai_label = ' + '.join(ai_providers) if ai_providers else 'Disabled'
+    if _puter_pkg_available():
+        ai_providers.append(f'Puter/GPT ({_PUTER_MODEL})')
+    ai_label = ' + '.join(ai_providers) if ai_providers else 'Disabled (no Gemini key, no puter.js)'
 
     info(f"Target:     {C.Bo}{C.Y}{target}{C.Re}")
     if input_hostname and resolved_ip != target:

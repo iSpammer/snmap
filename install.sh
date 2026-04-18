@@ -212,6 +212,22 @@ check_tool hydra         "apt install hydra"
 check_tool medusa        "apt install medusa"
 
 echo ""
+echo -e "${BOLD}AI (Puter/GPT free fallback):${RESET}"
+if command -v node &>/dev/null; then
+    good "node: $(node --version)"
+    if node -e 'require("@heyputer/puter.js")' 2>/dev/null; then
+        good "@heyputer/puter.js: installed"
+    else
+        warn "@heyputer/puter.js: not installed"
+        info "  Installing: npm install -g @heyputer/puter.js"
+        npm install -g @heyputer/puter.js 2>/dev/null && good "@heyputer/puter.js: installed" || warn "npm install failed — install manually"
+    fi
+else
+    warn "node: not found (needed for free Puter/GPT AI fallback)"
+    info "  Install: apt install nodejs npm"
+fi
+
+echo ""
 echo -e "${BOLD}Wordlists (recommended):${RESET}"
 for wl in /usr/share/wordlists /usr/share/seclists; do
     if [ -d "$wl" ]; then
@@ -236,7 +252,8 @@ echo -e "    ${CYAN}smartnmap <target>/24${RESET}                # CIDR (host-di
 echo -e "    ${CYAN}smartnmap --install-scripts${RESET}          # Install NSE scripts"
 echo ""
 echo -e "  Config file for API keys: ${CYAN}~/.config/smartnmap/config.json${RESET}"
-echo -e "  Env overrides:            ${CYAN}GEMINI_API_KEY, GEMINI_MODEL, PUTER_AUTH_TOKEN${RESET}"
+echo -e "  Env overrides:            ${CYAN}GEMINI_API_KEY, GEMINI_MODEL${RESET}"
+echo -e "  Free AI fallback:         Puter/GPT — just run: ${CYAN}npm install -g @heyputer/puter.js${RESET} (no key needed)"
 echo ""
 echo -e "  Or run directly:"
 echo -e "    ${CYAN}python3 $SMARTNMAP <target>${RESET}"

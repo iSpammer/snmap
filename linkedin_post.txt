@@ -1,0 +1,25 @@
+Excited to open-source SmartNmap — a multi-phase Nmap reconnaissance framework I built for CTF and bug bounty work.
+
+One thing I always found frustrating: running nmap manually and realizing I missed the right NSE scripts for an obscure service. Or getting a version banner back and having to manually cross-reference exploitdb. SmartNmap fixes all of that.
+
+What it does:
+
+6 phases, fully automated:
+1. Port discovery — TCP/UDP, with masscan/rustscan fallback
+2. Service fingerprinting — -sV -sC -A with per-host timeouts
+3. Targeted NSE scripts — 160+ service mappings (FTP, SMB, LDAP, Kerberos, Redis, Oracle, Cassandra, SIP, RTSP, Docker, and more)
+4. Vuln scan — vulners, vulscan, CVE correlation via cve.circl.lu
+5. Supplementary tools — gobuster, nikto, nuclei, enum4linux, smbmap, ldapsearch, AS-REP roasting, shellshock PoC, TLS inspection, vhost brute-forcing
+6. Loot & report — credentials, flags, SSH keys, interesting shares — all captured in a severity-sorted REPORT.md
+
+Searchsploit runs automatically against every discovered product version. Markdown reports include Metasploit module hints. CTF mode hunts for user.txt, root.txt, and SMB/NFS flag files automatically.
+
+Optional AI analysis (Gemini or Qwen via Puter) advises at each phase — or the whole thing runs standalone with zero external dependencies beyond Python 3 stdlib.
+
+Single file. Zero pip installs. Drop it on any Kali box and run.
+
+→ GitHub: https://github.com/iSpammer/snmap
+
+Tested against HTB machines. Happy to hear feedback from the community.
+
+#CyberSecurity #PenTesting #CTF #HackTheBox #BugBounty #Nmap #OpenSource #Python

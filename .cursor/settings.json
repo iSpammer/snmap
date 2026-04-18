@@ -1,0 +1,85 @@
+{
+  "plugins": {
+    "appwrite-plugin": {
+      "enabled": true
+    },
+    "cli-for-agent": {
+      "enabled": true
+    },
+    "agent-compatibility": {
+      "enabled": true
+    },
+    "huggingface-skills": {
+      "enabled": true
+    },
+    "parallel": {
+      "enabled": true
+    },
+    "superpowers": {
+      "enabled": true
+    },
+    "compound-engineering": {
+      "enabled": true
+    },
+    "cursor-team-kit": {
+      "enabled": true
+    },
+    "sagemaker-ai": {
+      "enabled": true
+    },
+    "databases-on-aws": {
+      "enabled": true
+    },
+    "elastic": {
+      "enabled": true
+    },
+    "firebase": {
+      "enabled": true
+    },
+    "aws-amplify": {
+      "enabled": true
+    },
+    "aws-serverless": {
+      "enabled": true
+    },
+    "amazon-location-service": {
+      "enabled": true
+    },
+    "mongodb": {
+      "enabled": true
+    },
+    "postman": {
+      "enabled": true
+    },
+    "gitlab": {
+      "enabled": true
+    },
+    "firecrawl": {
+      "enabled": true
+    },
+    "tldraw": {
+      "enabled": true
+    },
+    "1password": {
+      "enabled": true
+    },
+    "wix": {
+      "enabled": true
+    },
+    "runlayer": {
+      "enabled": true
+    },
+    "redis-development": {
+      "enabled": true
+    },
+    "atlassian": {
+      "enabled": true
+    },
+    "continual-learning": {
+      "enabled": true
+    },
+    "deploy-on-aws": {
+      "enabled": true
+    }
+  }
+}
