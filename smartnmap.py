@@ -192,7 +192,7 @@ _PUTER_PKG_OK = None           # cached package-check result
 
 
 def _puter_pkg_available():
-    """Check once if @heyputer/puter.js is installed. Cached after first call."""
+    """Check once if @heyputer/puter.js is installed on a compatible Node (>=18)."""
     global _PUTER_PKG_OK
     if _PUTER_PKG_OK is not None:
         return _PUTER_PKG_OK
@@ -200,6 +200,13 @@ def _puter_pkg_available():
         _PUTER_PKG_OK = False
         return False
     try:
+        # Check Node version >= 18
+        r = subprocess.run(['node', '-e', 'process.exit(parseInt(process.versions.node)<18?1:0)'],
+                           capture_output=True, timeout=5)
+        if r.returncode != 0:
+            warn("Puter AI requires Node.js >=18 (run: nvm install 18 or apt install nodejs)")
+            _PUTER_PKG_OK = False
+            return False
         r = subprocess.run(
             ['node', '-e', 'require("@heyputer/puter.js"); process.exit(0)'],
             capture_output=True, timeout=6)
