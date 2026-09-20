@@ -400,6 +400,49 @@ class TestCredStateMachine(unittest.TestCase):
         self.assertIn('anonymous ftp', joined)
 
 
+class TestBrokenAuth(unittest.TestCase):
+    def _jwt(self, header, payload):
+        import base64, json
+        b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).decode().rstrip('=')
+        return f"{b(header)}.{b(payload)}."
+
+    def test_cookie_missing_flags(self):
+        loot = smartnmap.LootTracker()
+        v = smartnmap.analyze_cookies("Set-Cookie: SESSIONID=abc; Path=/", True, loot)
+        self.assertTrue(any('HttpOnly' in x['desc'] and 'Secure' in x['desc'] for x in v))
+
+    def test_cookie_secure_not_flagged_on_http(self):
+        loot = smartnmap.LootTracker()
+        v = smartnmap.analyze_cookies("Set-Cookie: sid=abc; HttpOnly; SameSite=Lax", False, loot)
+        # HttpOnly+SameSite present and not https -> no missing-flag finding
+        self.assertFalse(any('missing' in x['desc'] for x in v))
+
+    def test_tamperable_role_cookie(self):
+        self.assertIsNotNone(smartnmap._cookie_tamper_reason('role', 'admin'))
+        self.assertIsNotNone(smartnmap._cookie_tamper_reason('uid', '42'))
+        self.assertIsNone(smartnmap._cookie_tamper_reason('csrftoken',
+                          'a9Xk2Lm8Qp4Zr7Ns1Wt6Yv3Bc5Df0Gh'))
+
+    def test_jwt_alg_none(self):
+        loot = smartnmap.LootTracker()
+        v = smartnmap.decode_and_flag_jwt(self._jwt({"alg": "none"}, {"user": "x"}), "t", loot)
+        self.assertTrue(any('alg=none' in x['desc'] for x in v))
+        self.assertTrue(any(x['severity'] == 'critical' for x in v))
+
+    def test_jwt_hs256_flagged_medium(self):
+        loot = smartnmap.LootTracker()
+        v = smartnmap.decode_and_flag_jwt(self._jwt({"alg": "HS256"}, {"exp": 1}), "t", loot)
+        self.assertTrue(any('HS256' in x['desc'] or 'HMAC' in x['desc'] for x in v))
+
+    def test_detect_login_form_and_csrf(self):
+        body = ('<form action="/login" method="post">'
+                '<input name="username"><input type="password" name="password"></form>')
+        surface = smartnmap.detect_auth_surface('http://t', body, {'urls': set()}, None)
+        self.assertIsNotNone(surface['login_form'])
+        self.assertEqual(surface['login_form']['pass'], 'password')
+        self.assertIsNone(surface['login_form']['csrf'])  # no csrf field -> flagged elsewhere
+
+
 class TestHelpers(unittest.TestCase):
     def test_is_ip(self):
         self.assertTrue(smartnmap._is_ip('10.10.10.10'))
