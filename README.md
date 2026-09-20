@@ -115,15 +115,26 @@ symlink. The key files are:
    always run; injection/brute tools fire only with `--active` (or `--ctf`),
    and otherwise emit a ready-to-run command into the report.
 
+   Plus **broken-authentication testing** (OWASP WSTG-ATHN/SESS): cookie-flag
+   audit, tamperable-cookie detection (url/base64/hex-decoded role/session data),
+   **JWT decode** (`alg:none`, HS256 crack, no-exp), session-token-in-URL, login
+   default-creds + weak-lockout probe (throwaway user) + username-enum, and a
+   detect-and-recommend playbook for MFA/OAuth/password-reset logic flaws.
+   And **hash identification + cracking**: every captured hash (Kerberoast,
+   `/etc/shadow`, JWT, DB dumps) is fingerprinted (hashcat mode + john), looked
+   up on crackcrypt.com (with `--crack`/`--active`), and any cracked plaintext
+   re-enters the credential loop. Foothold/RCE findings emit **pentestmonkey
+   reverse-shell one-liners** (`--lhost`/`--lport`).
+
    **Feedback loop (the kill-chain differentiator):** `LootTracker` is a
    credential *state machine*, not a logbook. Any credential discovered (brute,
-   spray, share loot, `--creds`) triggers a **credential-reuse sweep** — it's
-   tried against every other discovered service (SMB/SSH/WinRM/MSSQL/LDAP/FTP
-   via netexec), and a validated cred auto-drives credentialed AD collection
-   (Kerberoast/BloodHound). The report opens with a **Kill-Chain Narrative**
-   that stitches loot into the ordered path and surfaces *chain enablers*
-   (anon FTP, readable shares, leaked usernames, default-cred panels, valid
-   creds) above raw CVSS.
+   spray, share loot, cracked hash, `--creds`) triggers a **credential-reuse
+   sweep** — it's tried against every other discovered service (SMB/SSH/WinRM/
+   MSSQL/LDAP/FTP via netexec), and a validated cred auto-drives credentialed AD
+   collection (Kerberoast/BloodHound). The report opens with a **Kill-Chain
+   Narrative** that stitches loot into the ordered path and surfaces *chain
+   enablers* (anon FTP, readable shares, leaked usernames, default-cred panels,
+   `alg:none` JWTs, tamperable cookies, valid creds) above raw CVSS.
 6. **Analysis & report** — dedup by `(port, cve, desc)`, severity sort
    (`critical → info`), Markdown report, optional Gemini attack-path synthesis.
 
@@ -174,6 +185,9 @@ OFFENSIVE / ACTIVE (safe-by-default; gated)
   --userlist FILE     username wordlist for brute/spray
   --passlist FILE     password wordlist for brute/spray
   --domain DOMAIN     AD/Kerberos domain (auto-detected from LDAP if omitted)
+  --crack             look up captured hashes on crackcrypt.com (external egress)
+  --lhost IP          attacker IP for generated reverse-shell payloads
+  --lport PORT        attacker port for reverse shells (default 4444)
 
 WEB
   --vhosts            vhost brute-force on discovered HTTP ports
@@ -235,7 +249,7 @@ python3 smartnmap.py --bb --vhosts --hostname acme.com acme.com
 
 ```bash
 python3 tests/test_parsing.py
-# 62 tests covering CIDR expansion, target validation, vuln-DB regexes,
+# 75 tests covering CIDR expansion, target validation, vuln-DB regexes,
 # severity heuristics, CVE/CVSS extraction, NSE mapping, and LootTracker.
 ```
 

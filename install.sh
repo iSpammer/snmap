@@ -257,6 +257,10 @@ if ! command -v ssrfmap &>/dev/null; then
     fi
 fi
 
+echo -e "\n${BOLD}Password cracking (hash ID is built-in; crackcrypt.com API needs no install):${RESET}"
+check_tool hashcat      "hashcat"      "hashcat"      "-" "-" "-" "-"
+check_tool john         "john"         "john"         "-" "-" "-" "apt install john-data for wordlists"
+
 echo -e "\n${BOLD}Active Directory / Kerberos:${RESET}"
 check_tool kerbrute        "kerbrute"          "-" "-" "-" "github.com/ropnop/kerbrute@latest" "-"
 check_tool GetUserSPNs.py  "impacket (Kerberoast/AS-REP/lookupsid)" "-" "impacket" "-" "-" "pipx install impacket"

