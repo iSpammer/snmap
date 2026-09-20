@@ -3236,6 +3236,38 @@ def run_ad_enum_unauth(target, services, outdir, args, tools, loot=None, domain=
                     loot.add('usernames', u)
                 loot.add('notes', f"AD users (RID-brute): {len(users)}")
 
+        # Writable shares are a direct foothold (file drop / poisoning / cron pickup)
+        for line in out.splitlines():
+            m = re.match(r'\s*SMB\s+\S+\s+\d+\s+\S+\s+(\S+)\s+.*WRITE', line)
+            if m and m.group(1).upper() not in ('IPC$',):
+                sh = m.group(1)
+                good(f"  WRITABLE share: {sh}")
+                if loot:
+                    loot.add('auth_findings', f"writable SMB share: {sh} (file-drop / hash-capture / cron vector)")
+                    loot.add_step(f"SMB: writable share {sh} -> drop payload / SCF-lnk hash capture / cron pickup")
+                vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                             'desc': f'Writable SMB share "{sh}" via null/guest session', 'cve': '',
+                             'exploit': f"smbclient //{target}/{sh} -N -c 'put <file>'",
+                             'severity': 'high'})
+
+    # rpcclient SAMR enumeration — finds users on standalone Samba where RID-brute fails
+    if has_smb and shutil.which('rpcclient'):
+        info(f"rpcclient enumdomusers on {target} (null session)")
+        _, ru, _ = _run(['rpcclient', '-N', '-U', '%', target,
+                        '-c', 'enumdomusers;enumdomgroups;querydispinfo'], timeout=90)
+        (outdir / 'rpcclient_enum.txt').write_text(ru)
+        rusers = sorted(set(re.findall(r'user:\[([^\]]+)\]', ru)))
+        if rusers:
+            adf = outdir / 'ad_users.txt'
+            existing = adf.read_text().splitlines() if adf.exists() else []
+            adf.write_text('\n'.join(sorted(set(existing) | set(rusers))))
+            context['users'] = sorted(set((context.get('users') or []) + rusers))
+            good(f"  rpcclient users ({len(rusers)}): {', '.join(rusers[:20])}")
+            if loot:
+                for u in rusers:
+                    loot.add('usernames', u)
+                loot.add_step(f"SMB: enumerated {len(rusers)} users via rpcclient SAMR")
+
     if has_kerberos and domain and shutil.which('kerbrute'):
         users_file = outdir / 'ad_users.txt'
         ulist = str(users_file) if users_file.exists() else (
