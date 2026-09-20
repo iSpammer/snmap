@@ -5107,6 +5107,89 @@ def run_smb_hashcapture(target, services, outdir, args, tools, loot=None, contex
     return vulns
 
 
+_ARTIFACT_RE = re.compile(
+    r'(?:href|src)=["\']([^"\']*?(?:/download/|/dl/|/files?/|/uploads?/|/backups?/|'
+    r'\.(?:zip|tar|tgz|gz|bz2|7z|rar|bak|old|sql|jar|war|apk|bin|elf|sh|py|pl|rb|php|'
+    r'txt|conf|cfg|ini|env|yaml|yml|json|pdf|db|sqlite|key|pem|ovpn))[^"\']*)["\']', re.I)
+
+
+def download_artifacts(url, port, outdir, args, loot=None):
+    """Download files linked from the page (/download/, backups, binaries, scripts,
+    configs, archives) and analyse them for secrets, creds, endpoints and source —
+    a common foothold (leaked source, config, or a downloadable processor to review).
+    Extracts archives and scans contents. General web capability."""
+    vulns = []
+    if not shutil.which('curl'):
+        return vulns
+    from urllib.parse import urljoin
+    _, body, _ = _run(['curl', '-skL', '--max-time', '10', url], timeout=15)
+    cands = set()
+    for m in _ARTIFACT_RE.finditer(body or ''):
+        cands.add(urljoin(url.rstrip('/') + '/', m.group(1)))
+    if not cands:
+        return vulns
+    adir = outdir / 'artifacts'
+    adir.mkdir(exist_ok=True)
+    subsection("Downloadable Artifact Analysis")
+    for u in sorted(cands)[:15]:
+        name = re.sub(r'[^A-Za-z0-9._-]', '_', (u.split('/')[-1] or 'artifact').split('?')[0])[:60] or 'artifact'
+        dest = adir / name
+        _run(['curl', '-skL', '--max-time', '25', '-o', str(dest), u], timeout=30)
+        if not (dest.exists() and dest.stat().st_size):
+            continue
+        ft = ''
+        if shutil.which('file'):
+            _, ft, _ = _run(['file', '-b', str(dest)], timeout=10)
+        ft = ft.strip()
+        good(f"  downloaded {u} -> {name} [{ft[:60]}]")
+        if loot:
+            loot.add('files', f'{u} -> {dest} ({ft[:60]})')
+            loot.add_step(f"Web: downloaded artifact {name} ({ft[:40]}) for analysis")
+        low = (name + ' ' + ft).lower()
+        exdir = adir / (name + '_x')
+        try:
+            if 'zip' in low and shutil.which('unzip'):
+                _run(['unzip', '-o', '-q', str(dest), '-d', str(exdir)], timeout=40)
+            elif ('tar' in low or 'gzip' in low or name.endswith(('.tgz', '.tar.gz', '.tar', '.gz'))) and shutil.which('tar'):
+                exdir.mkdir(exist_ok=True)
+                _run(['tar', 'xf', str(dest), '-C', str(exdir)], timeout=40)
+        except Exception:
+            pass
+        # scan the file (+ extracted contents) for secrets/source
+        scan_paths = [dest] + (list(exdir.rglob('*')) if exdir.exists() else [])
+        endpoints = set()
+        for p in scan_paths:
+            if p.is_file() and p.stat().st_size < 3_000_000:
+                try:
+                    txt = p.read_text(errors='ignore')
+                except Exception:
+                    continue
+                if loot:
+                    loot.scan_output(txt[:60000])
+                for m in re.finditer(r'(?i)\b(system|exec|popen|subprocess|shell_exec|passthru|eval|os\.command|'
+                                     r'child_process|proc_open)\s*\(', txt):
+                    endpoints.add(f'code-exec sink: {m.group(1)}()')
+                for m in re.finditer(r'(?i)(password|passwd|pwd|secret|api[_-]?key|token|username|user)\s*[:=]\s*["\']?([^\s"\',;]{3,})', txt):
+                    if 'example' not in m.group(2).lower() and '<' not in m.group(2):
+                        loot.add('creds', f"{name}: {m.group(1)}={m.group(2)}") if loot else None
+        # surface source/scripts + code-exec sinks
+        if endpoints:
+            for e in sorted(endpoints):
+                good(f"    {name}: {e}")
+            if loot:
+                loot.add('auth_findings', f"{name} contains dangerous sinks: {', '.join(sorted(endpoints)[:5])}")
+            vulns.append({'port': port, 'service': 'http', 'product': 'web app', 'version': '',
+                         'desc': f'Downloadable processor/source with code-exec sinks: {name}', 'cve': '',
+                         'exploit': f'review {dest} for command injection / job-submission RCE',
+                         'severity': 'high'})
+        if any(k in low for k in ('ascii text', 'python', 'shell script', 'php', 'perl', 'source', 'script')):
+            headtxt = dest.read_text(errors='ignore')[:2000]
+            print(f"    --- {name} (source head) ---")
+            for l in headtxt.splitlines()[:45]:
+                print(f"    {l[:170]}")
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -5386,6 +5469,7 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
         js_urls, _links = harvest_page_intel(url, port, outdir, loot)
         shellshock_vulns += analyze_js(js_urls, outdir, args, loot)
         shellshock_vulns += run_prototype_pollution(url, port, pc, outdir, args, tools, loot)
+        shellshock_vulns += download_artifacts(url, port, outdir, args, loot)
         fetch_robots_sitemap(url, outdir, loot)
         # dirs from gobuster output + crawl corpus paths feed the listing/broken-perm check
         _dirs = set()
