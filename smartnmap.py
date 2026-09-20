@@ -5190,6 +5190,145 @@ def download_artifacts(url, port, outdir, args, loot=None):
     return vulns
 
 
+def run_autonomous(target, services, outdir, args, loot=None, context=None, vulns=None):
+    """AI-driven autonomous exploitation loop: the embedded AI decides the next shell
+    command from the current recon state (services, page source, downloaded processor
+    source, loot, findings), the tool executes it, feeds the result back, and iterates
+    toward the user.txt and root.txt flags. Requires --auto + a Gemini key. All actions
+    are logged; obviously-destructive local commands are refused."""
+    if not (getattr(args, 'auto', False) and getattr(args, 'api_key', '')):
+        return
+    section("AUTONOMOUS AI EXPLOITATION")
+    api_key = args.api_key
+    lhost = getattr(args, 'lhost', None) or '10.10.16.189'
+    steps = int(getattr(args, 'auto_steps', None) or 24)
+    logf = outdir / 'autonomous_log.md'
+    log = [f"# Autonomous run — {target}\n"]
+    vulns = vulns or []
+
+    # seed the AI with the highest-value context it can't see otherwise
+    artifacts_txt = ''
+    adir = outdir / 'artifacts'
+    if adir.exists():
+        for p in list(adir.rglob('*'))[:12]:
+            if p.is_file() and p.stat().st_size < 30000:
+                try:
+                    artifacts_txt += f"\n--- {p.name} ---\n" + p.read_text(errors='ignore')[:8000]
+                except Exception:
+                    pass
+    page_src = ''
+    for f in sorted(outdir.glob('html_intel_*.txt')) + sorted(outdir.glob('fingerprint_*.txt')):
+        try:
+            page_src += f"\n--- {f.name} ---\n" + f.read_text(errors='ignore')[:4000]
+        except Exception:
+            pass
+
+    def _state():
+        return {
+            'target': target, 'attacker_ip': lhost,
+            'open_services': {str(p): f"{s.get('service', '')} {s.get('product', '')} {s.get('version', '')}".strip()
+                              for p, s in services.items()},
+            'creds': ([f"{c['user']}:{c.get('pw')}" for c in getattr(loot, 'valid_creds', [])]
+                      + list(getattr(loot, 'creds', []))[:15]),
+            'usernames': list(dict.fromkeys(getattr(loot, 'usernames', [])))[:30],
+            'notes': list(getattr(loot, 'notes', []))[:25],
+            'auth_findings': list(getattr(loot, 'auth_findings', []))[:20],
+            'findings': [v.get('desc', '') for v in vulns][:30],
+            'flags_found': list(getattr(loot, 'flags', [])),
+        }
+
+    tools_avail = [t for t in ('curl', 'wget', 'nc', 'ncat', 'smbclient', 'ssh', 'sshpass',
+                               'python3', 'gobuster', 'ffuf', 'nmap', 'nikto', 'hydra', 'john',
+                               'hashcat', 'ssh-keygen', 'openssl', 'base64') if shutil.which(t)]
+    history = []
+    found = set(re.findall(r'HTB\{[^}]+\}|\b[a-f0-9]{32}\b', ' '.join(getattr(loot, 'flags', []))))
+
+    for i in range(steps):
+        prompt = f"""You are an autonomous penetration-testing agent operating a Kali attacker shell (your IP {lhost}).
+GOAL: retrieve BOTH the user.txt and root.txt flags from the AUTHORIZED HackTheBox target {target}.
+Each step you output ONE non-interactive shell command; I execute it and return stdout/stderr; you then decide the next.
+Work methodically: understand the service, get a foothold/shell, find user.txt, escalate to root, read root.txt.
+
+LOCAL TOOLS: {', '.join(tools_avail)}. You may pipe/redirect, use python3 -c, here-docs, nc, timeouts.
+RULES: exactly one command; fully non-interactive (background listeners with & then continue; use timeout); only touch {target}; keep output small (head/grep).
+
+TARGET WEB PAGE / FINGERPRINT:
+{page_src[:3500]}
+
+DOWNLOADED PROCESSOR / ARTIFACT SOURCE (study for the job format + vulnerability):
+{artifacts_txt[:9000]}
+
+CURRENT STATE:
+{json.dumps(_state(), indent=1, default=str)[:3500]}
+
+RECENT HISTORY (command -> output):
+{json.dumps(history[-6:], indent=1, default=str)[:6000]}
+
+Respond with ONLY a JSON object (no prose):
+{{"cmd":"<one shell command>","why":"<short reason>","done":<true only if BOTH flags obtained>,"flag":"<any flag string you observed or empty>"}}"""
+        ans = query_ai(prompt, api_key=api_key, timeout=90) or ''
+        m = re.search(r'\{.*\}', ans, re.S)
+        if not m:
+            warn("  AI returned no parseable action; stopping")
+            break
+        raw = m.group(0)
+        try:
+            action = json.loads(raw)
+        except Exception:
+            try:
+                action = json.loads(raw[:raw.rfind('}') + 1])
+            except Exception:
+                warn("  could not parse AI action; stopping")
+                break
+        for fl in re.findall(r'HTB\{[^}]+\}', str(action.get('flag', ''))):
+            found.add(fl)
+            if loot:
+                loot.add('flags', fl)
+        cmd = (action.get('cmd') or '').strip()
+        if action.get('done') or len(found) >= 2:
+            good("  AI signalled completion")
+            break
+        if not cmd:
+            history.append({'cmd': '', 'out': '(no command)'})
+            continue
+        if re.search(r'rm\s+-rf\s+/(?!home|tmp|root/smartnmap)|mkfs|:\(\)\s*\{|shutdown|reboot|'
+                     r'dd\s+if=\S+\s+of=/dev/', cmd):
+            warn(f"  refused unsafe command: {cmd}")
+            history.append({'cmd': cmd, 'out': 'REFUSED (unsafe local op)'})
+            continue
+        info(f"  [auto {i + 1}/{steps}] {C.Cy}{cmd[:220]}{C.Re}")
+        try:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=200)
+            out = (r.stdout or '') + (r.stderr or '')
+        except subprocess.TimeoutExpired:
+            out = '[command timed out]'
+        except Exception as e:
+            out = f'[exec error: {e}]'
+        out = out.strip()[-6000:]
+        newflags = re.findall(r'HTB\{[^}]+\}', out)
+        for fl in newflags:
+            found.add(fl)
+            if loot:
+                loot.add('flags', fl)
+            good(f"  ★ FLAG: {fl}")
+        for fl in re.findall(r'^\s*([a-f0-9]{32})\s*$', out, re.M):
+            found.add(fl)
+            if loot:
+                loot.add('flags', f'flag(32hex): {fl}')
+            good(f"  ★ possible flag (32-hex): {fl}")
+        history.append({'cmd': cmd, 'why': action.get('why', ''), 'out': out[:1800]})
+        log.append(f"\n## step {i + 1} — {action.get('why', '')}\n```\n$ {cmd}\n{out[:2500]}\n```")
+        logf.write_text('\n'.join(log))
+        if len(found) >= 2:
+            good("  both flags captured — stopping")
+            break
+    if found:
+        good(f"  Autonomous run captured flags: {', '.join(sorted(found))}")
+    else:
+        info("  autonomous loop finished without both flags (see autonomous_log.md)")
+    logf.write_text('\n'.join(log))
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -6157,6 +6296,7 @@ def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=No
                      outdir, args, loot, fp=None)
     # Blockers + AI-suggested manual path when no foothold/cred was obtained
     ai_block_report(target, services, vulns_sorted, loot, args, outdir)
+    run_autonomous(target, services, outdir, args, loot=loot, context=None, vulns=vulns_sorted)
 
     # AI Deep Analysis
     ai_response = None
@@ -6660,6 +6800,8 @@ Setup:
     offense.add_argument('--lport', help='Attacker port for reverse-shell payloads (default 4444)')
     offense.add_argument('--mqtt-listen', help='Seconds to subscribe to MQTT topics (default 45)')
     offense.add_argument('--catch-wait', help='Seconds to wait for a reverse-shell callback / share auto-processing (default 280)')
+    offense.add_argument('--auto', action='store_true', help='Autonomous AI-driven exploitation loop toward the flags')
+    offense.add_argument('--auto-steps', help='Max autonomous decision steps (default 24)')
 
     output = p.add_argument_group('Output')
     output.add_argument('-o', '--output', help='Output directory')
