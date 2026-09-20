@@ -278,5 +278,154 @@ class TestLootTracker(unittest.TestCase):
         self.assertTrue(flag_found, f"Expected HTB flag in {loot.flags}")
 
 
+class _Args:
+    """Lightweight args stand-in for gating tests."""
+    def __init__(self, **kw):
+        self.active = False
+        self.ctf = False
+        self.bb = False
+        self.no_crawl = False
+        self.oob = False
+        self.creds = ''
+        self.userlist = None
+        self.passlist = None
+        self.domain = None
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+class TestActiveGating(unittest.TestCase):
+    def test_active_flag_enables(self):
+        self.assertTrue(smartnmap.active_enabled(_Args(active=True)))
+
+    def test_ctf_enables(self):
+        self.assertTrue(smartnmap.active_enabled(_Args(ctf=True)))
+
+    def test_default_disabled(self):
+        self.assertFalse(smartnmap.active_enabled(_Args()))
+
+    def test_bb_alone_disabled(self):
+        # --bb without --active must NOT turn on intrusive tools
+        self.assertFalse(smartnmap.active_enabled(_Args(bb=True)))
+
+    def test_injection_gated_off_returns_no_findings(self):
+        # Safety-critical: with active off, no confirmed vuln may be produced
+        loot = smartnmap.LootTracker()
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_injection_suite(
+                {'http://t/p.php?id=1'}, Path(d), _Args(), {}, loot)
+        self.assertEqual(v, [])
+
+    def test_ssrf_gated_off_returns_no_findings(self):
+        loot = smartnmap.LootTracker()
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_ssrf_suite(
+                {'http://t/x?url=http://a'}, Path(d), _Args(), {}, loot)
+        self.assertEqual(v, [])
+
+    def test_cred_attacks_gated_off_returns_no_findings(self):
+        loot = smartnmap.LootTracker()
+        svc = {22: {'service': 'ssh'}, 21: {'service': 'ftp'}}
+        ctx = {}
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_credential_attacks('t', svc, Path(d), _Args(), {}, loot, context=ctx)
+        self.assertEqual(v, [])
+        # Safety: gated off must never fabricate/leak a credential into the reuse loop
+        self.assertNotIn('creds', ctx)
+
+    def test_crawl_disabled_by_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            c = smartnmap.build_web_corpus(
+                'http://t', 80, 't', Path(d), _Args(no_crawl=True), {}, None)
+        self.assertEqual(c, {'urls': set(), 'params': set()})
+
+
+class TestCredStateMachine(unittest.TestCase):
+    def test_add_cred_verified_vs_candidate(self):
+        loot = smartnmap.LootTracker()
+        loot.add_cred('admin', 'pass', source='hydra', scope='ssh', verified=True)
+        loot.add_cred('bob', 'x', source='web', scope='web', verified=False)
+        self.assertEqual(len(loot.valid_creds), 1)
+        self.assertEqual(len(loot.candidate_creds), 1)
+        # also mirrored into the human-readable creds list for the report
+        self.assertTrue(any('admin:pass' in c for c in loot.creds))
+
+    def test_add_cred_dedup(self):
+        loot = smartnmap.LootTracker()
+        loot.add_cred('admin', 'pass', verified=True)
+        loot.add_cred('admin', 'pass', verified=True)
+        self.assertEqual(len(loot.valid_creds), 1)
+
+    def test_get_unused_and_mark_used(self):
+        loot = smartnmap.LootTracker()
+        c = loot.add_cred('admin', 'pass', verified=True)
+        self.assertEqual(len(loot.get_unused_creds()), 1)
+        loot.mark_used(c)
+        self.assertEqual(len(loot.get_unused_creds()), 0)
+
+    def test_add_step_dedup(self):
+        loot = smartnmap.LootTracker()
+        loot.add_step('foothold')
+        loot.add_step('foothold')
+        self.assertEqual(loot.chain, ['foothold'])
+
+    def test_reuse_gated_off_is_noop(self):
+        # No --active and no --creds => reuse sweep must not run (returns [], cred stays unused)
+        loot = smartnmap.LootTracker()
+        c = loot.add_cred('admin', 'pass', verified=True)
+        svc = {445: {'service': 'microsoft-ds'}, 22: {'service': 'ssh'}}
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_credential_reuse('t', svc, Path(d), _Args(), {}, loot, context={})
+        self.assertEqual(v, [])
+        self.assertFalse(c['used'])
+
+    def test_web_foothold_gated_off_no_findings(self):
+        loot = smartnmap.LootTracker()
+        corpus = {'urls': set(), 'params': set()}
+        with tempfile.TemporaryDirectory() as d:
+            v = smartnmap.run_web_foothold_suite('http://127.0.0.1:1', 80, corpus,
+                                                 Path(d), _Args(), {}, loot)
+        self.assertEqual(v, [])
+
+    def test_chain_enablers_surfaces_loot(self):
+        loot = smartnmap.LootTracker()
+        loot.add_cred('svc', 'Passw0rd', source='spray', scope='smb', verified=True)
+        loot.add('shares', 'backup READ')
+        loot.add('usernames', 'administrator')
+        vulns = [{'port': 21, 'desc': 'Anonymous FTP access', 'severity': 'low'}]
+        enablers = smartnmap._chain_enablers(loot, vulns, {})
+        joined = ' '.join(enablers).lower()
+        self.assertIn('svc:passw0rd', joined)
+        self.assertIn('readable share', joined)
+        self.assertIn('anonymous ftp', joined)
+
+
+class TestHelpers(unittest.TestCase):
+    def test_is_ip(self):
+        self.assertTrue(smartnmap._is_ip('10.10.10.10'))
+        self.assertFalse(smartnmap._is_ip('example.htb'))
+
+    def test_hydra_service_map(self):
+        # nmap service names resolve to the right hydra module
+        self.assertEqual(smartnmap._HYDRA_SERVICES.get('ssh'), 'ssh')
+        self.assertEqual(smartnmap._HYDRA_SERVICES.get('microsoft-ds'), 'smb')
+        self.assertEqual(smartnmap._HYDRA_SERVICES.get('ms-wbt-server'), 'rdp')
+
+    def test_recommend_bucket(self):
+        loot = smartnmap.LootTracker()
+        smartnmap._recommend(loot, 'sqlmap -u x', 'why')
+        self.assertTrue(any('sqlmap' in r for r in loot.recommend))
+
+    def test_loot_write_includes_recommend(self):
+        loot = smartnmap.LootTracker()
+        loot.add('recommend', 'nxc smb 10.0.0.1 --shares')
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d) / 'loot.md'
+            loot.write(out)
+            body = out.read_text()
+        self.assertIn('RECOMMEND', body.upper())
+        self.assertIn('nxc smb', body)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

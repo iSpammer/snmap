@@ -29,6 +29,16 @@ sudo apt install -y nmap gobuster nikto whatweb sslscan enum4linux-ng smbmap \
                     ldap-utils seclists exploitdb dnsutils
 pip install --break-system-packages impacket
 go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+
+# Kill-chain extras (crawlers, injection, AD) — or just run ./install.sh --run:
+sudo apt install -y sqlmap commix hydra medusa feroxbuster
+pip install --break-system-packages arjun bloodhound
+go install github.com/projectdiscovery/katana/cmd/katana@latest
+go install github.com/lc/gau/v2/cmd/gau@latest
+go install github.com/tomnomnom/waybackurls@latest
+go install github.com/hahwul/dalfox/v2@latest
+go install github.com/ropnop/kerbrute@latest
+git clone https://github.com/swisskyrepo/SSRFmap   # symlink ssrfmap.py onto PATH
 ```
 
 Optional AI (Gemini):
@@ -93,10 +103,44 @@ symlink. The key files are:
    `/admin/`, …), nikto, nuclei, wpscan, sslscan/testssl, enum4linux,
    smbclient/smbmap, showmount, ldapsearch, Kerberos AS-REP roast,
    built-in **shellshock PoC**, FTP anonymous check, SSL cert SAN harvest.
+   Now also: **web crawling** (katana/hakrawler/gospider + gau/waybackurls +
+   arjun) into a shared URL/parameter corpus that feeds **web foothold
+   heuristics** (HTML-intel harvest of users/emails/tech, default-cred probe,
+   LFI, IDOR), **injection testing** (sqlmap, dalfox, commix), **SSRF**
+   (ssrfmap + interactsh OOB), **credential attacks** (hydra/medusa),
+   **SMB/NFS share pull-and-mine** (download readable shares → scan for
+   creds/keys/flags), and **Windows/AD/SMB** (netexec null/RID enum,
+   username==password spray, kerbrute, Kerberoast, BloodHound).
+   Everything intrusive is **safe-by-default**: crawlers and passive enum
+   always run; injection/brute tools fire only with `--active` (or `--ctf`),
+   and otherwise emit a ready-to-run command into the report.
+
+   **Feedback loop (the kill-chain differentiator):** `LootTracker` is a
+   credential *state machine*, not a logbook. Any credential discovered (brute,
+   spray, share loot, `--creds`) triggers a **credential-reuse sweep** — it's
+   tried against every other discovered service (SMB/SSH/WinRM/MSSQL/LDAP/FTP
+   via netexec), and a validated cred auto-drives credentialed AD collection
+   (Kerberoast/BloodHound). The report opens with a **Kill-Chain Narrative**
+   that stitches loot into the ordered path and surfaces *chain enablers*
+   (anon FTP, readable shares, leaked usernames, default-cred panels, valid
+   creds) above raw CVSS.
 6. **Analysis & report** — dedup by `(port, cve, desc)`, severity sort
    (`critical → info`), Markdown report, optional Gemini attack-path synthesis.
 
 ---
+
+## Cyber kill-chain coverage
+
+| Stage | What SmartNmap does | Tools |
+|-------|---------------------|-------|
+| **Recon** | port/service discovery, crawling, URL/param corpus, subdomains, cert SANs | nmap, masscan/rustscan, katana/hakrawler/gospider, gau/waybackurls, arjun, httpx, subfinder |
+| **Enumeration** | targeted NSE, web dirs, SMB/LDAP/NFS/SNMP/FTP, AD users (netexec null/RID) | NSE, gobuster/ffuf, nikto, whatweb, enum4linux-ng, smbmap, netexec |
+| **Vuln ID** | CVE lookup, nuclei, searchsploit, severity-rated findings | vulners NSE, nuclei, searchsploit |
+| **Exploitation** *(active-gated)* | SQLi/XSS/cmd-injection, SSRF, credential brute, Kerberoast/AS-REP | sqlmap, dalfox, commix, ssrfmap, hydra/medusa, kerbrute, impacket |
+| **Post-ex candidates** *(gated / detect-and-recommend)* | AD graph collection, WinRM/MSSQL access, secretsdump hints | bloodhound-python, evil-winrm, netexec |
+
+Active/exploitation tools never run without `--active` (or `--ctf`). When gated
+off, the report's **Loot → Recommend** section lists the exact command to run.
 
 ## Key CLI flags
 
@@ -118,8 +162,18 @@ TIMING / STEALTH
   --no-retry          skip retries on filtered ports
 
 MODES
-  --ctf               CTF mode (default looting, hostname tricks)
+  --ctf               CTF mode (default looting, hostname tricks; enables --active)
   --bb                bug-bounty mode (skips DoS/slowloris/nessus scripts)
+
+OFFENSIVE / ACTIVE (safe-by-default; gated)
+  --active            enable intrusive tools: sqlmap, dalfox, commix, ssrfmap,
+                      hydra/kerbrute/netexec brute (also on in --ctf)
+  --no-crawl          skip web crawling + the URL/param corpus
+  --oob               use interactsh OOB canary for blind SSRF/RCE
+  --creds USER:PASS   creds for authenticated AD collection (Kerberoast/BloodHound)
+  --userlist FILE     username wordlist for brute/spray
+  --passlist FILE     password wordlist for brute/spray
+  --domain DOMAIN     AD/Kerberos domain (auto-detected from LDAP if omitted)
 
 WEB
   --vhosts            vhost brute-force on discovered HTTP ports
@@ -181,7 +235,7 @@ python3 smartnmap.py --bb --vhosts --hostname acme.com acme.com
 
 ```bash
 python3 tests/test_parsing.py
-# 43 tests covering CIDR expansion, target validation, vuln-DB regexes,
+# 62 tests covering CIDR expansion, target validation, vuln-DB regexes,
 # severity heuristics, CVE/CVSS extraction, NSE mapping, and LootTracker.
 ```
 

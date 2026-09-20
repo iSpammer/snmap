@@ -222,6 +222,47 @@ echo -e "\n${BOLD}Brute forcing:${RESET}"
 check_tool hydra        "hydra"         "hydra"         "-"       "-" "-" "-"
 check_tool medusa       "medusa"        "medusa"        "-"       "-" "-" "-"
 
+echo -e "\n${BOLD}Web crawlers / URL & param discovery:${RESET}"
+check_tool katana       "katana"        "-" "-" "-" "github.com/projectdiscovery/katana/cmd/katana@latest" "-"
+check_tool hakrawler    "hakrawler"     "-" "-" "-" "github.com/hakluke/hakrawler@latest" "-"
+check_tool gospider     "gospider"      "-" "-" "-" "github.com/jaeles-project/gospider@latest" "-"
+check_tool gau          "gau"           "-" "-" "-" "github.com/lc/gau/v2/cmd/gau@latest" "-"
+check_tool waybackurls  "waybackurls"   "-" "-" "-" "github.com/tomnomnom/waybackurls@latest" "-"
+check_tool arjun        "arjun"         "-" "arjun" "-" "-" "-"
+check_tool httpx        "httpx"         "-" "-" "-" "github.com/projectdiscovery/httpx/cmd/httpx@latest" "-"
+check_tool subfinder    "subfinder"     "-" "-" "-" "github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest" "-"
+check_tool feroxbuster  "feroxbuster"   "feroxbuster" "-" "-" "-" "cargo install feroxbuster"
+
+echo -e "\n${BOLD}Injection / SSRF (active-gated — used only with --active or --ctf):${RESET}"
+check_tool sqlmap       "sqlmap"        "sqlmap"        "sqlmap" "-" "-" "-"
+check_tool dalfox       "dalfox"        "-" "-" "-" "github.com/hahwul/dalfox/v2@latest" "-"
+check_tool commix       "commix"        "commix"        "-" "-" "-" "-"
+check_tool interactsh-client "interactsh-client" "-" "-" "-" "github.com/projectdiscovery/interactsh/cmd/interactsh-client@latest" "-"
+# SSRFmap has no package — clone it and symlink a launcher onto PATH
+if ! command -v ssrfmap &>/dev/null; then
+    warn "ssrfmap: NOT installed"
+    if $AUTO_INSTALL; then
+        SSRFMAP_DIR="$HOME/.local/share/SSRFmap"
+        if git clone --depth 1 https://github.com/swisskyrepo/SSRFmap "$SSRFMAP_DIR" 2>/dev/null; then
+            pip3 install --break-system-packages -r "$SSRFMAP_DIR/requirements.txt" 2>/dev/null
+            printf '#!/bin/bash\ncd "%s" && python3 ssrfmap.py "$@"\n' "$SSRFMAP_DIR" \
+                > "$HOME/.local/bin/ssrfmap" 2>/dev/null && chmod +x "$HOME/.local/bin/ssrfmap" \
+                && good "ssrfmap: installed to ~/.local/bin (ensure it is on PATH)" \
+                || warn "ssrfmap: cloned to $SSRFMAP_DIR — add a launcher to PATH manually"
+        else
+            warn "ssrfmap: clone failed — git clone https://github.com/swisskyrepo/SSRFmap"
+        fi
+    else
+        info "  git clone https://github.com/swisskyrepo/SSRFmap  (then symlink ssrfmap.py onto PATH)"
+    fi
+fi
+
+echo -e "\n${BOLD}Active Directory / Kerberos:${RESET}"
+check_tool kerbrute        "kerbrute"          "-" "-" "-" "github.com/ropnop/kerbrute@latest" "-"
+check_tool GetUserSPNs.py  "impacket (Kerberoast/AS-REP/lookupsid)" "-" "impacket" "-" "-" "pipx install impacket"
+check_tool bloodhound-python "bloodhound-python" "-" "bloodhound" "-" "-" "-"
+check_tool evil-winrm      "evil-winrm"        "-" "-" "evil-winrm" "-" "-"
+
 # ── Node.js / Puter AI ──
 echo -e "\n${BOLD}AI (Puter/GPT — free, no key needed):${RESET}"
 
