@@ -4418,7 +4418,7 @@ def harvest_page_intel(url, port, outdir, loot=None):
     # flags / emails / creds in source
     for pat, cat in ((r'(?:HTB|THM|FLAG|flag)\{[^}]+\}', 'flags'),
                      (r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', 'usernames')):
-        for v in set(re.findall(pat, body))[:20]:
+        for v in list(set(re.findall(pat, body)))[:20]:
             if loot:
                 loot.add(cat, v)
     if loot:
